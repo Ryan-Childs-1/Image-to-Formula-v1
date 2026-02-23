@@ -5,6 +5,19 @@ import numpy as np
 import streamlit as st
 from PIL import Image
 
+# ============================================================
+# Optional local-AI dependencies (standalone, no API)
+# ============================================================
+# We integrate the Neural LUT editor *without* breaking compression if torch isn't installed.
+# If torch is missing, the AI tab will explain how to install it.
+try:
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
 
 # ============================================================
 # Why your computer started crashing (and what we fix here)
@@ -454,7 +467,14 @@ def ss_init():
     st.session_state.setdefault("last_download_blob", None)
     st.session_state.setdefault("last_download_name", None)
     st.session_state.setdefault("last_download_mime", None)
-    st.session_state.setdefault("last_download_sig", None)  # identifies which settings produced blob
+    st.session_state.setdefault("last_download_sig", None)
+
+    # Local AI Editor state
+    st.session_state.setdefault("ai_base_u8", None)          # selected base image for AI editor (uint8)
+    st.session_state.setdefault("ai_ref_u8", None)           # reference look image (uint8)
+    st.session_state.setdefault("ai_model", None)            # trained NeuralLUT (torch)
+    st.session_state.setdefault("ai_loss_trace", None)       # list of floats
+    st.session_state.setdefault("ai_edited_u8", None)        # edited output (uint8)
 
 
 def ss_clear_download():
@@ -468,32 +488,146 @@ ss_init()
 
 
 # ============================================================
+# Local AI Editor: Neural LUT (standalone, train-on-the-fly)
+# ============================================================
+
+if TORCH_AVAILABLE:
+    class NeuralLUT(nn.Module):
+        """
+        Tiny MLP mapping RGB -> RGB (acts like a learned smooth 3D LUT).
+        Great for "style/grade transfer" (mood, palette shifts), not object edits.
+        """
+        def __init__(self, width: int = 64, depth: int = 4):
+            super().__init__()
+            layers = []
+            in_dim = 3
+            for _ in range(int(depth)):
+                layers.append(nn.Linear(in_dim, int(width)))
+                layers.append(nn.SiLU())
+                in_dim = int(width)
+            layers.append(nn.Linear(in_dim, 3))
+            self.net = nn.Sequential(*layers)
+
+        def forward(self, x):
+            y = self.net(x)
+            # residual + tanh stabilizes and preserves structure
+            y = x + 0.5 * torch.tanh(y)
+            return torch.clamp(y, 0.0, 1.0)
+
+
+    def _resize_keep_aspect_u8(img_u8: np.ndarray, max_side: int) -> np.ndarray:
+        H, W, _ = img_u8.shape
+        if max(H, W) <= int(max_side):
+            return img_u8
+        scale = int(max_side) / float(max(H, W))
+        newW = max(1, int(round(W * scale)))
+        newH = max(1, int(round(H * scale)))
+        im = Image.fromarray(img_u8, mode="RGB").resize((newW, newH), Image.LANCZOS)
+        return np.array(im, dtype=np.uint8)
+
+
+    def _resize_to_match_u8(a_u8: np.ndarray, b_u8: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        Ha, Wa, _ = a_u8.shape
+        imB = Image.fromarray(b_u8, mode="RGB").resize((Wa, Ha), Image.LANCZOS)
+        return a_u8, np.array(imB, dtype=np.uint8)
+
+
+    def _sample_pixels(rgb01_a: np.ndarray, rgb01_b: np.ndarray, n: int, seed: int = 0) -> Tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(int(seed))
+        H, W, _ = rgb01_a.shape
+        total = H * W
+        n = min(int(n), total)
+        idx = rng.choice(total, size=n, replace=False)
+        xa = rgb01_a.reshape(-1, 3)[idx]
+        xb = rgb01_b.reshape(-1, 3)[idx]
+        return xa, xb
+
+
+    def train_neural_lut(
+        x_in: np.ndarray,
+        y_tgt: np.ndarray,
+        width: int,
+        depth: int,
+        steps: int,
+        batch: int,
+        lr: float,
+        weight_decay: float,
+        device: str,
+    ) -> Tuple[NeuralLUT, List[float]]:
+        torch.manual_seed(0)
+        model = NeuralLUT(width=int(width), depth=int(depth)).to(device)
+
+        X = torch.from_numpy(x_in.astype(np.float32, copy=False)).to(device)
+        Y = torch.from_numpy(y_tgt.astype(np.float32, copy=False)).to(device)
+
+        opt = torch.optim.AdamW(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+
+        n = X.shape[0]
+        batch = max(64, int(batch))
+        loss_trace: List[float] = []
+
+        model.train()
+        for t in range(int(steps)):
+            idx = torch.randint(0, n, (batch,), device=device)
+            xb = X[idx]
+            yb = Y[idx]
+            pred = model(xb)
+            loss = F.mse_loss(pred, yb)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            if (t % 25) == 0 or (t == int(steps) - 1):
+                loss_trace.append(float(loss.detach().cpu().item()))
+
+        model.eval()
+        return model, loss_trace
+
+
+    @torch.no_grad()
+    def apply_lut_chunked(model: NeuralLUT, img01: np.ndarray, device: str, chunk: int) -> np.ndarray:
+        H, W, _ = img01.shape
+        flat = img01.reshape(-1, 3).astype(np.float32, copy=False)
+        out = np.empty_like(flat)
+
+        chunk = int(chunk)
+        chunk = max(10_000, min(chunk, 1_000_000))  # safety
+        for i0 in range(0, flat.shape[0], chunk):
+            i1 = min(flat.shape[0], i0 + chunk)
+            xb = torch.from_numpy(flat[i0:i1]).to(device)
+            yb = model(xb).detach().cpu().numpy()
+            out[i0:i1] = yb
+
+        return out.reshape(H, W, 3)
+
+
+# ============================================================
 # Streamlit UI
 # ============================================================
 
-st.set_page_config(page_title="Image ⇄ Formula (Stable Downloads)", layout="wide")
-st.title("Image ⇄ Formula — Stable + Safe Download Compression (No More Crashes)")
+st.set_page_config(page_title="Image ⇄ Formula + Local AI Editor", layout="wide")
+st.title("Image ⇄ Formula — Stable Downloads + Local AI Editor (No API)")
 
 st.markdown(
     "Key change: heavy work only happens when you click buttons.\n\n"
-    "- **Generate formula** (does the quantization + formula creation)\n"
-    "- **Prepare download** (builds WEBP/JPEG/PNG bytes once, then you can download)\n"
+    "- **Generate formula** (quantization + formula creation)\n"
+    "- **Prepare download** (builds WEBP/JPEG/PNG bytes once)\n"
+    "- **Local AI Editor** (optional): trains a tiny model to learn a color/lighting transform\n"
 )
 
-
-mode = st.radio("Choose conversion", ["Image → Formula", "Formula → Image"], horizontal=True)
-st.divider()
+# Use tabs so we don't lose existing functionality
+tab1, tab2, tab3 = st.tabs(["Image → Formula", "Formula → Image", "AI Editor (Local, no API)"])
 
 
 # ============================================================
-# IMAGE → FORMULA
+# TAB 1: IMAGE → FORMULA
 # ============================================================
-
-if mode == "Image → Formula":
+with tab1:
     with st.sidebar:
         st.header("Image input")
         local_images = list_local_images(".")
-        source_mode = st.radio("Source", ["Local file", "Upload"], index=0)
+        source_mode = st.radio("Source", ["Local file", "Upload"], index=0, key="t1_source")
 
         chosen_local = None
         upload = None
@@ -502,52 +636,55 @@ if mode == "Image → Formula":
                 st.warning("No images found next to app.py. Add .png/.jpg files or switch to Upload.")
             else:
                 name_to_path = {os.path.basename(p): p for p in local_images}
-                chosen_name = st.selectbox("Choose local image", list(name_to_path.keys()))
+                chosen_name = st.selectbox("Choose local image", list(name_to_path.keys()), key="t1_local_name")
                 chosen_local = name_to_path[chosen_name]
         else:
-            upload = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp", "bmp"])
+            upload = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp", "bmp"], key="t1_upload")
 
         st.divider()
         st.header("Safety caps (lower if your machine is struggling)")
         max_pixels = st.select_slider(
             "Max working pixels (H×W cap)",
             options=[750_000, 1_500_000, 3_000_000, 6_000_000],
-            value=3_000_000
+            value=3_000_000,
+            key="t1_maxpix"
         )
         max_pixels = int(min(max_pixels, MAX_PIXELS_HARD))
 
         max_side = st.select_slider(
             "Max side (preserve aspect)",
             options=[256, 384, 512, 768, 1024, 1280, 1536, 2048],
-            value=1024
+            value=1024,
+            key="t1_maxside"
         )
         max_side = int(min(max_side, MAX_SIDE_HARD))
 
         st.divider()
         st.header("Simplified color spectrum")
-        palette_mode = st.radio("Spectrum type", ["Adaptive (Pillow)", "Fixed Palette"], index=0)
+        palette_mode = st.radio("Spectrum type", ["Adaptive (Pillow)", "Fixed Palette"], index=0, key="t1_pal_mode")
 
         palette_param: Dict[str, Any] = {}
         if palette_mode == "Adaptive (Pillow)":
-            k = st.select_slider("Number of colors (K)", options=[4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256], value=32)
-            method = st.selectbox("Palette method", ["Fast Octree", "Median-cut", "Max Coverage"], index=0)
-            dither = st.checkbox("Dither (Floyd–Steinberg)", value=True)
+            k = st.select_slider("Number of colors (K)", options=[4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256], value=32, key="t1_k")
+            method = st.selectbox("Palette method", ["Fast Octree", "Median-cut", "Max Coverage"], index=0, key="t1_method")
+            dither = st.checkbox("Dither (Floyd–Steinberg)", value=True, key="t1_dither")
             palette_param = {"k": int(k), "method": method, "dither": bool(dither)}
         else:
             name = st.selectbox(
                 "Fixed palette",
                 ["CGA 16", "GameBoy (4-color)", "Grayscale 16", "Grayscale 32", "Web-safe 216"],
-                index=0
+                index=0,
+                key="t1_fixed_name"
             )
             palette_param = {"name": name}
 
         st.divider()
         st.header("Download settings (built only on button click)")
-        dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0)
-        dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768)
-        dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1)
-        dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True)
-        dl_lossless_webp = st.checkbox("Lossless WEBP", value=False)
+        dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="t1_dl_fmt")
+        dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="t1_dl_side")
+        dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="t1_dl_q")
+        dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="t1_dl_png")
+        dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="t1_dl_webp_lossless")
 
         dl_max_side = int(min(dl_max_side, MAX_SIDE_HARD))
 
@@ -594,6 +731,12 @@ if mode == "Image → Formula":
             st.session_state["last_input_info"] = info
             st.session_state["last_formula_bytes"] = len(formula.encode("utf-8"))
 
+            # Also make it immediately available as AI base
+            st.session_state["ai_base_u8"] = recon_u8
+            st.session_state["ai_edited_u8"] = None
+            st.session_state["ai_model"] = None
+            st.session_state["ai_loss_trace"] = None
+
         # If we have a last result, show it (no recompute)
         if st.session_state["last_formula"] is not None:
             formula = st.session_state["last_formula"]
@@ -621,7 +764,6 @@ if mode == "Image → Formula":
                 else:
                     r1.metric("Orig / Formula ratio", "—")
             with r2:
-                # A realistic baseline: WEBP(80) for the *same palette image* (not the original)
                 base_webp = pil_save_bytes(recon_u8, "WEBP", quality=80, method=6)
                 if isinstance(orig_file_bytes0, int) and orig_file_bytes0 > 0:
                     r2.metric("Orig / WEBP(80) ratio", f"{orig_file_bytes0/float(len(base_webp)):.2f}×")
@@ -642,20 +784,18 @@ if mode == "Image → Formula":
             st.image(maybe_downscale_u8(recon_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
 
             st.subheader("Prepare downloadable compressed image (built only when you click)")
-            # Signature identifies whether download settings changed since blob built
             sig_src = f"{meta['w']}x{meta['h']}|{dl_format}|{dl_max_side}|{dl_quality}|{dl_opt_png}|{dl_lossless_webp}"
             sig = stable_hash_bytes(sig_src.encode("utf-8"))
 
             colp1, colp2 = st.columns([1, 1])
             with colp1:
-                prep = st.button("Prepare download", type="secondary")
+                prep = st.button("Prepare download", type="secondary", key="t1_prep_dl")
             with colp2:
                 st.caption("This step compresses the image file (WEBP/JPEG/PNG). It can take a moment for large images.")
 
             if prep:
                 ss_clear_download()
                 with st.spinner("Building compressed download…"):
-                    # Downscale for download with additional hard cap
                     dl_u8 = maybe_downscale_u8(
                         recon_u8,
                         max_side=int(dl_max_side),
@@ -682,7 +822,6 @@ if mode == "Image → Formula":
                         name = "modified_compressed.jpg"
                         mime = "image/jpeg"
                     else:
-                        # PNG can be huge; keep, but guardrail the memory
                         blob = pil_save_bytes(
                             dl_u8, "PNG",
                             optimize=bool(dl_opt_png),
@@ -692,7 +831,6 @@ if mode == "Image → Formula":
                         mime = "image/png"
 
                     if len(blob) > MAX_DOWNLOAD_BYTES_IN_MEMORY:
-                        # Prevent memory blowups / browser issues
                         raise RuntimeError(
                             f"Download file is too large to hold in memory ({human_size(len(blob))}). "
                             f"Lower download max side or choose WEBP/JPEG."
@@ -703,7 +841,6 @@ if mode == "Image → Formula":
                     st.session_state["last_download_mime"] = mime
                     st.session_state["last_download_sig"] = sig
 
-            # Show download button only if prepared and settings match
             if st.session_state["last_download_blob"] is not None and st.session_state["last_download_sig"] == sig:
                 blob = st.session_state["last_download_blob"]
                 name = st.session_state["last_download_name"]
@@ -737,23 +874,22 @@ if mode == "Image → Formula":
 
 
 # ============================================================
-# FORMULA → IMAGE
+# TAB 2: FORMULA → IMAGE
 # ============================================================
-
-else:
+with tab2:
     st.subheader("Paste a formula string to reconstruct the image")
-    formula_in = st.text_area("Formula", height=220, placeholder=f"{APP_FORMULA_PREFIX}...")
+    formula_in = st.text_area("Formula", height=220, placeholder=f"{APP_FORMULA_PREFIX}...", key="t2_formula")
 
     st.markdown("### Download settings (built only on button click)")
-    dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="f2_fmt")
-    dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="f2_side")
-    dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="f2_q")
-    dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="f2_png")
-    dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="f2_webp_lossless")
+    dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="t2_fmt")
+    dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="t2_side")
+    dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="t2_q")
+    dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="t2_png")
+    dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="t2_webp_lossless")
 
     colA, colB = st.columns([1, 2])
     with colA:
-        do_recon = st.button("Reconstruct image", type="primary")
+        do_recon = st.button("Reconstruct image", type="primary", key="t2_recon")
     with colB:
         st.caption("Reconstruction is usually fast. Download compression happens only when you click Prepare download.")
 
@@ -767,10 +903,15 @@ else:
             st.session_state["last_recon_u8"] = img_u8
             st.session_state["last_meta"] = meta
 
+            # Also make it available to AI editor
+            st.session_state["ai_base_u8"] = img_u8
+            st.session_state["ai_edited_u8"] = None
+            st.session_state["ai_model"] = None
+            st.session_state["ai_loss_trace"] = None
+
             st.success(f"Reconstructed {meta['w']}×{meta['h']} | K={meta['k']} | bpp={meta['bpp']} | {meta['palette_mode']}")
             st.image(maybe_downscale_u8(img_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
 
-            # Always provide lossless PNG download (small enough usually; still can be big)
             png_blob = pil_save_bytes(img_u8, "PNG", optimize=True, compress_level=9)
             if len(png_blob) <= MAX_DOWNLOAD_BYTES_IN_MEMORY:
                 st.download_button("Download reconstructed PNG (lossless)", data=png_blob, file_name="reconstructed.png", mime="image/png")
@@ -780,7 +921,6 @@ else:
         except Exception as e:
             st.error(f"Formula → Image failed: {e}")
 
-    # If we have a reconstructed image in session, allow download prep
     if st.session_state.get("last_recon_u8") is not None and st.session_state.get("last_meta") is not None:
         img_u8 = st.session_state["last_recon_u8"]
         meta = st.session_state["last_meta"]
@@ -791,7 +931,7 @@ else:
         sig_src = f"{meta['w']}x{meta['h']}|{dl_format}|{dl_max_side}|{dl_quality}|{dl_opt_png}|{dl_lossless_webp}"
         sig = stable_hash_bytes(sig_src.encode("utf-8"))
 
-        prep = st.button("Prepare download", key="f2_prep")
+        prep = st.button("Prepare download", key="t2_prep")
         if prep:
             ss_clear_download()
             try:
@@ -842,3 +982,202 @@ else:
 
         with st.expander("Show decoded meta"):
             st.json(meta)
+
+
+# ============================================================
+# TAB 3: AI EDITOR (LOCAL, NO API) — integrated, safe, button-driven
+# ============================================================
+with tab3:
+    st.subheader("AI Editor (Local, no API) — Neural LUT (Color/Lighting Transform)")
+
+    if not TORCH_AVAILABLE:
+        st.error(
+            "PyTorch is not installed in this environment, so the local AI editor can't run.\n\n"
+            "Install it in your environment, then rerun Streamlit:\n"
+            "  pip install torch\n"
+            "On some systems you may want the CPU-only build from PyTorch's install selector."
+        )
+        st.stop()
+
+    st.markdown(
+        "This editor trains a tiny neural network that learns a smooth mapping:\n\n"
+        r"\[(r,g,b)\;\mapsto\;(r',g',b')\]\n\n"
+        "- Works great for **mood / palette / lighting** changes (like a learned color grade).\n"
+        "- Not meant for adding/removing objects.\n\n"
+        "**Integration:** the edited image can be pushed back into the compressor (session_state['last_recon_u8'])."
+    )
+
+    # Base selection
+    colL, colR = st.columns([1, 1])
+    with colL:
+        base_source = st.radio(
+            "Base image source",
+            ["Use last image from compressor", "Upload base image"],
+            index=0,
+            key="ai_base_source"
+        )
+        base_u8: Optional[np.ndarray] = None
+
+        if base_source == "Use last image from compressor":
+            base_u8 = st.session_state.get("last_recon_u8", None)
+            if base_u8 is None:
+                st.warning("No last image found. Go to Image→Formula or Formula→Image and generate/reconstruct first.")
+            else:
+                base_u8 = np.array(base_u8, dtype=np.uint8)
+        else:
+            up_base = st.file_uploader("Upload base image", type=["png", "jpg", "jpeg", "webp", "bmp"], key="ai_up_base")
+            if up_base is not None:
+                with Image.open(up_base) as im:
+                    im = im.convert("RGB")
+                    base_u8 = np.array(im, dtype=np.uint8)
+
+    with colR:
+        ref_u8: Optional[np.ndarray] = None
+        up_ref = st.file_uploader("Upload reference look image", type=["png", "jpg", "jpeg", "webp", "bmp"], key="ai_up_ref")
+        if up_ref is not None:
+            with Image.open(up_ref) as im:
+                im = im.convert("RGB")
+                ref_u8 = np.array(im, dtype=np.uint8)
+
+    if base_u8 is None:
+        st.stop()
+    st.session_state["ai_base_u8"] = base_u8
+
+    st.divider()
+    st.subheader("Preview")
+    p1, p2 = st.columns(2)
+    with p1:
+        st.caption("Base")
+        st.image(maybe_downscale_u8(base_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
+    with p2:
+        st.caption("Reference look (optional but recommended)")
+        if ref_u8 is None:
+            st.info("Upload a reference look image to train the AI.")
+        else:
+            st.image(maybe_downscale_u8(ref_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
+
+    if ref_u8 is None:
+        st.stop()
+
+    st.session_state["ai_ref_u8"] = ref_u8
+
+    st.divider()
+    st.subheader("Training settings (safe defaults)")
+
+    c1, c2, c3, c4 = st.columns(4)
+    train_max_side = c1.selectbox("Train max side", [256, 384, 512, 768, 1024], index=2, key="ai_train_side")
+    sample_n = c2.selectbox("Pixel samples", [20_000, 50_000, 100_000, 200_000, 400_000], index=2, key="ai_samples")
+    steps = c3.selectbox("Steps", [200, 400, 800, 1200, 2000], index=2, key="ai_steps")
+    batch = c4.selectbox("Batch", [256, 512, 1024, 2048, 4096], index=3, key="ai_batch")
+
+    c5, c6, c7, c8 = st.columns(4)
+    width = c5.selectbox("Width", [32, 48, 64, 96, 128], index=2, key="ai_width")
+    depth = c6.selectbox("Depth", [2, 3, 4, 5, 6], index=2, key="ai_depth")
+    lr = c7.selectbox("LR", [1e-4, 2e-4, 5e-4, 1e-3, 2e-3], index=3, key="ai_lr")
+    weight_decay = c8.selectbox("Weight decay", [0.0, 1e-6, 1e-5, 1e-4, 1e-3], index=3, key="ai_wd")
+
+    apply_chunk = st.selectbox("Apply chunk (RAM safety)", [50_000, 100_000, 200_000, 400_000], index=2, key="ai_chunk")
+
+    use_cuda = st.checkbox("Use GPU if available", value=True, key="ai_use_cuda")
+    device = "cuda" if use_cuda and torch.cuda.is_available() else "cpu"
+    st.caption(f"Device: {device}")
+
+    # Buttons
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 1])
+    train_btn = b1.button("Train AI LUT", type="primary", key="ai_train_btn")
+    apply_btn = b2.button("Apply LUT to base", key="ai_apply_btn")
+    push_btn = b3.button("Send edited image to compressor", key="ai_push_btn")
+    clear_btn = b4.button("Clear AI state", key="ai_clear_btn")
+
+    if clear_btn:
+        st.session_state["ai_model"] = None
+        st.session_state["ai_loss_trace"] = None
+        st.session_state["ai_edited_u8"] = None
+        st.success("Cleared AI state.")
+
+    if train_btn:
+        try:
+            with st.spinner("Preparing training data…"):
+                # downscale both for speed
+                base_train = _resize_keep_aspect_u8(base_u8, max_side=int(train_max_side))
+                ref_train = _resize_keep_aspect_u8(ref_u8, max_side=int(train_max_side))
+                base_train, ref_train = _resize_to_match_u8(base_train, ref_train)
+
+                a01 = to_float01(base_train)
+                b01 = to_float01(ref_train)
+                x_in, y_tgt = _sample_pixels(a01, b01, n=int(sample_n), seed=0)
+
+            with st.spinner("Training Neural LUT…"):
+                model, loss_trace = train_neural_lut(
+                    x_in=x_in,
+                    y_tgt=y_tgt,
+                    width=int(width),
+                    depth=int(depth),
+                    steps=int(steps),
+                    batch=int(batch),
+                    lr=float(lr),
+                    weight_decay=float(weight_decay),
+                    device=device
+                )
+
+            st.session_state["ai_model"] = model
+            st.session_state["ai_loss_trace"] = loss_trace
+            st.session_state["ai_edited_u8"] = None
+            st.success(f"Trained. Last loss: {loss_trace[-1]:.6f}")
+
+        except Exception as e:
+            st.error(f"Training failed: {e}")
+
+    loss_trace = st.session_state.get("ai_loss_trace", None)
+    if isinstance(loss_trace, list) and len(loss_trace) > 1:
+        st.line_chart(loss_trace)
+
+    if apply_btn:
+        model = st.session_state.get("ai_model", None)
+        if model is None:
+            st.error("Train the LUT first.")
+        else:
+            try:
+                with st.spinner("Applying LUT to full base image…"):
+                    base01 = to_float01(base_u8)
+                    out01 = apply_lut_chunked(model, base01, device=device, chunk=int(apply_chunk))
+                    out_u8 = to_uint8(out01)
+
+                st.session_state["ai_edited_u8"] = out_u8
+                st.success("Applied LUT.")
+            except Exception as e:
+                st.error(f"Apply failed: {e}")
+
+    edited_u8 = st.session_state.get("ai_edited_u8", None)
+    if edited_u8 is not None:
+        st.divider()
+        st.subheader("Edited output")
+        st.image(maybe_downscale_u8(edited_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
+
+        # Downloads (computed once here, but small + safe; you can still hit memory caps)
+        png_blob = pil_save_bytes(edited_u8, "PNG", optimize=True, compress_level=9)
+        webp_blob = pil_save_bytes(edited_u8, "WEBP", quality=85, method=6)
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Edited PNG (lossless)", human_size(len(png_blob)))
+        d2.metric("Edited WEBP (85)", human_size(len(webp_blob)))
+        d3.metric("Resolution", f"{edited_u8.shape[1]}×{edited_u8.shape[0]}")
+
+        x1, x2 = st.columns(2)
+        x1.download_button("Download edited PNG", data=png_blob, file_name="ai_edited.png", mime="image/png")
+        x2.download_button("Download edited WEBP", data=webp_blob, file_name="ai_edited.webp", mime="image/webp")
+
+        if push_btn:
+            # Push edited image back into the compressor pipeline
+            st.session_state["last_recon_u8"] = edited_u8
+            st.session_state["last_meta"] = {
+                "type": "ai_local_neural_lut",
+                "notes": "Edited in local AI tab. Use Image→Formula to re-compress.",
+                "h": int(edited_u8.shape[0]),
+                "w": int(edited_u8.shape[1]),
+            }
+            ss_clear_download()
+            st.success("Sent edited image to compressor as session_state['last_recon_u8']. Now go to Image→Formula and Generate formula.")
+    else:
+        if push_btn:
+            st.warning("No edited image yet. Train and apply first.")
