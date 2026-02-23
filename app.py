@@ -79,6 +79,35 @@ def resize_keep_aspect(img01_rgb: np.ndarray, max_side: int) -> np.ndarray:
 
 
 # ============================================================
+# NEW: Export / compression helpers (download smaller image)
+# ============================================================
+
+def pil_save_bytes(img_u8: np.ndarray, fmt: str, **save_kwargs) -> bytes:
+    """
+    Save an RGB uint8 image to bytes in PNG/JPEG/WEBP.
+    """
+    pil = Image.fromarray(img_u8, mode="RGB")
+    buf = io.BytesIO()
+    pil.save(buf, format=fmt, **save_kwargs)
+    return buf.getvalue()
+
+
+def maybe_downscale_u8(img_u8: np.ndarray, max_side: int) -> np.ndarray:
+    """
+    Downscale image so max(H,W)=max_side (if needed). Keeps aspect ratio.
+    """
+    max_side = int(max_side)
+    H, W, _ = img_u8.shape
+    if max(H, W) <= max_side:
+        return img_u8
+    scale = max_side / float(max(H, W))
+    newW = max(1, int(round(W * scale)))
+    newH = max(1, int(round(H * scale)))
+    pil = Image.fromarray(img_u8, mode="RGB").resize((newW, newH), Image.LANCZOS)
+    return np.array(pil, dtype=np.uint8)
+
+
+# ============================================================
 # Binary formula encoding/decoding
 # ============================================================
 
@@ -165,19 +194,14 @@ def bits_needed(k: int) -> int:
 
 
 def pack_indices(indices: np.ndarray, bpp: int) -> bytes:
-    """
-    Pack uint indices into a bitstream with bpp bits per pixel.
-    indices: flat array of ints
-    """
     bpp = int(bpp)
     idx = indices.astype(np.uint32).ravel()
-    n = idx.size
 
     out = bytearray()
     acc = 0
     acc_bits = 0
-
     mask = (1 << bpp) - 1
+
     for v in idx:
         v = int(v) & mask
         acc |= (v << acc_bits)
@@ -194,9 +218,6 @@ def pack_indices(indices: np.ndarray, bpp: int) -> bytes:
 
 
 def unpack_indices(packed: bytes, n: int, bpp: int) -> np.ndarray:
-    """
-    Unpack n indices of bpp bits from packed bytes.
-    """
     bpp = int(bpp)
     data = np.frombuffer(packed, dtype=np.uint8)
     out = np.zeros((n,), dtype=np.uint32)
@@ -223,20 +244,11 @@ def unpack_indices(packed: bytes, n: int, bpp: int) -> np.ndarray:
 
 # ============================================================
 # Quantization engines
-#   - Best practical compression here = palette-indexed + zlib
-#   - Use Pillow's quantize (median-cut / octree) + optional dithering
 # ============================================================
 
 def pil_adaptive_quantize(rgb_u8: np.ndarray, colors: int, dither: bool, method: str) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    rgb_u8: (H,W,3) uint8
-    returns:
-      palette_u8: (K,3)
-      indices: (H,W) uint8 (0..K-1), where K == colors (or less, but usually colors)
-    """
     pil = Image.fromarray(rgb_u8, mode="RGB")
 
-    # Pillow methods: 0=MEDIANCUT, 1=MAXCOVERAGE, 2=FASTOCTREE, 3=LIBIMAGEQUANT (may not exist)
     method_map = {
         "Median-cut": 0,
         "Fast Octree": 2,
@@ -247,22 +259,17 @@ def pil_adaptive_quantize(rgb_u8: np.ndarray, colors: int, dither: bool, method:
 
     q = pil.quantize(colors=int(colors), method=m, dither=dith)
     pal = np.array(q.getpalette(), dtype=np.uint8).reshape(-1, 3)  # 256x3
-    idx = np.array(q, dtype=np.uint8)  # (H,W)
+    idx = np.array(q, dtype=np.uint8)
 
-    # effective palette entries are first `colors` (Pillow may still use <=colors)
     pal_eff = pal[:int(colors)].copy()
     return pal_eff, idx
 
 
 def nearest_palette_indices(rgb_u8: np.ndarray, palette_u8: np.ndarray) -> np.ndarray:
-    """
-    Vectorized nearest palette assignment in RGB (squared euclidean).
-    """
     H, W, _ = rgb_u8.shape
     X = rgb_u8.reshape(-1, 3).astype(np.int16)
     P = palette_u8.astype(np.int16)
 
-    # chunk to keep memory bounded
     n = X.shape[0]
     out = np.zeros((n,), dtype=np.int32)
     chunk = 50000
@@ -278,8 +285,6 @@ def nearest_palette_indices(rgb_u8: np.ndarray, palette_u8: np.ndarray) -> np.nd
 
 # ============================================================
 # Codec: palette-indexed image
-#   - stores (H,W,K,bpp, palette_mode) + packed indices
-#   - palette bytes stored ONLY when needed
 # ============================================================
 
 def encode_palette_image(
@@ -288,11 +293,6 @@ def encode_palette_image(
     palette_mode: str,
     palette_param: Dict[str, Any]
 ) -> Tuple[str, Dict[str, Any]]:
-    """
-    palette_mode:
-      - "Adaptive (Pillow)"  -> store palette bytes + indices
-      - "Fixed Palette"      -> store only indices; palette derived by name
-    """
     img = resize_keep_aspect(img01_rgb, max_side=int(max_side))
     rgb_u8 = to_uint8(img)
     H, W, _ = rgb_u8.shape
@@ -306,20 +306,15 @@ def encode_palette_image(
         palette_name = None
         palette_bytes = palette_u8.tobytes(order="C")
         palette_len = palette_u8.shape[0]
-
-        # NOTE: idx may contain values up to 255 even if k<256 (rare but can happen with Pillow palette semantics)
-        # Clamp safely:
         indices = np.clip(indices, 0, palette_len - 1)
-
         k_eff = palette_len
 
     elif palette_mode == "Fixed Palette":
         palette_name = str(palette_param.get("name", "CGA 16"))
         palette_u8 = fixed_palette_rgb_u8(palette_name)
         k_eff = int(palette_u8.shape[0])
-        palette_bytes = b""  # not stored
+        palette_bytes = b""
         palette_len = k_eff
-
         indices = nearest_palette_indices(rgb_u8, palette_u8)
 
     else:
@@ -340,7 +335,7 @@ def encode_palette_image(
         "palette_len": int(palette_len),
         "palette_bytes_len": int(len(palette_bytes)),
         "params": palette_param,
-        "notes": "Best practical formula compression here: palette-indexed image + bit-packed indices + zlib.",
+        "notes": "Palette-indexed image + bit-packed indices + zlib.",
     }
 
     coeff_bytes = palette_bytes + packed_idx
@@ -365,7 +360,6 @@ def decode_palette_image(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray
         packed_idx = coeff_bytes[pal_bytes_len:]
         palette_u8 = np.frombuffer(palette_bytes, dtype=np.uint8)
         if palette_u8.size != k * 3:
-            # tolerate if k differs from palette_len in meta, use palette_len
             pal_len = int(meta.get("palette_len", k))
             if palette_u8.size != pal_len * 3:
                 raise ValueError("Palette bytes mismatch (corrupt formula).")
@@ -411,13 +405,11 @@ st.set_page_config(page_title="Image ⇄ Formula (Best Palette Compression)", la
 st.title("Image ⇄ Formula — Best Practical Compression with Simplified Color Spectrums")
 
 st.markdown(
-    "This app uses a **best-practical formula compression** approach (given pure Python + NumPy + Pillow):\n\n"
+    "This app uses a **best-practical formula compression** approach (pure Python + NumPy + Pillow):\n\n"
     "- Convert image to a **simplified color spectrum** (palette)\n"
     "- Store only the **palette** + **bit-packed pixel indices**\n"
     "- Compress with **zlib**, encode as a **single formula string**\n\n"
-    "You can choose multiple spectrum types:\n"
-    "- **Adaptive palette (Pillow)**: best quality per size, optional dithering\n"
-    "- **Fixed palettes**: consistent stylization + very small formula (palette not stored)\n"
+    "**New**: you can also download a **smaller compressed image file** after modification.\n"
 )
 
 mode = st.radio("Choose conversion", ["Image → Formula", "Formula → Image"], horizontal=True)
@@ -444,7 +436,11 @@ if mode == "Image → Formula":
 
         st.divider()
         st.header("Output size / resolution")
-        max_side = st.select_slider("Max side (preserve aspect)", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=1024)
+        max_side = st.select_slider(
+            "Max side (preserve aspect)",
+            options=[256, 384, 512, 768, 1024, 1280, 1536, 2048],
+            value=1024
+        )
 
         st.divider()
         st.header("Simplified color spectrum")
@@ -458,7 +454,6 @@ if mode == "Image → Formula":
             dither = st.checkbox("Dither (Floyd–Steinberg)", value=True)
             palette_param = {"k": int(k), "method": method, "dither": bool(dither)}
             st.caption("Adaptive palettes usually deliver the best quality per byte. Dithering improves gradients.")
-
         else:
             name = st.selectbox(
                 "Fixed palette",
@@ -468,12 +463,21 @@ if mode == "Image → Formula":
             palette_param = {"name": name}
             st.caption("Fixed palettes are tiny (palette not stored) and give a strong stylized look.")
 
+        st.divider()
+        st.header("Download smaller image (compressed)")
+        dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0)
+        dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768)
+        dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1)
+        dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True)
+        dl_lossless_webp = st.checkbox("Lossless WEBP", value=False)
+
     try:
         img01 = load_image_from_choice(source_mode, chosen_local, upload)
 
         st.subheader("Selected image")
         st.image(to_uint8(img01), use_container_width=True)
 
+        # Build formula
         formula, meta = encode_palette_image(
             img01_rgb=img01,
             max_side=int(max_side),
@@ -494,6 +498,7 @@ if mode == "Image → Formula":
         st.subheader("Mathematical depiction")
         st.latex(latex_palette_model())
 
+        # Reconstruct preview
         st.subheader("Reconstructed preview (from formula)")
         meta2, coeff2 = unpack_formula(formula)
         recon_u8 = decode_palette_image(meta2, coeff2)
@@ -504,6 +509,59 @@ if mode == "Image → Formula":
             data=formula.encode("utf-8"),
             file_name="image_formula.txt",
             mime="text/plain",
+        )
+
+        # ============================================================
+        # NEW: Download compressed "smaller image" after modification
+        # ============================================================
+        st.subheader("Download a smaller compressed image (after modification)")
+
+        # Downscale for download target
+        dl_u8 = maybe_downscale_u8(recon_u8, max_side=int(dl_max_side))
+
+        # Encode to chosen format
+        fmt = dl_format.split()[0]  # "WEBP", "JPEG", "PNG"
+        if fmt == "WEBP":
+            data = pil_save_bytes(
+                dl_u8,
+                "WEBP",
+                quality=int(dl_quality),
+                lossless=bool(dl_lossless_webp),
+                method=6
+            )
+            out_name = "compressed.webp"
+            mime = "image/webp"
+        elif fmt == "JPEG":
+            data = pil_save_bytes(
+                dl_u8,
+                "JPEG",
+                quality=int(dl_quality),
+                optimize=True,
+                progressive=True
+            )
+            out_name = "compressed.jpg"
+            mime = "image/jpeg"
+        else:
+            # PNG (lossless) — can be large; optimize helps sometimes
+            data = pil_save_bytes(
+                dl_u8,
+                "PNG",
+                optimize=bool(dl_opt_png),
+                compress_level=9
+            )
+            out_name = "compressed.png"
+            mime = "image/png"
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Download image size", f"{dl_u8.shape[1]}×{dl_u8.shape[0]}")
+        d2.metric("File size", human_size(len(data)))
+        d3.metric("Format", fmt)
+
+        st.download_button(
+            "Download compressed image",
+            data=data,
+            file_name=out_name,
+            mime=mime,
         )
 
         with st.expander("Show decoded meta"):
@@ -517,6 +575,13 @@ else:
     st.subheader("Paste a formula string to reconstruct the image")
     formula_in = st.text_area("Formula", height=220, placeholder=f"{APP_FORMULA_PREFIX}...")
 
+    st.markdown("### Download options (after reconstruction)")
+    dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="dl_fmt_2")
+    dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="dl_side_2")
+    dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="dl_q_2")
+    dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="dl_png_2")
+    dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="dl_webp_lossless_2")
+
     if st.button("Reconstruct image", type="primary"):
         try:
             meta, coeff = unpack_formula(formula_in)
@@ -525,6 +590,7 @@ else:
             st.success(f"Reconstructed {meta['w']}×{meta['h']} | K={meta['k']} | bpp={meta['bpp']} | {meta['palette_mode']}")
             st.image(img_u8, use_container_width=True)
 
+            # Standard PNG download (original reconstructed)
             out_pil = Image.fromarray(img_u8, mode="RGB")
             buf = io.BytesIO()
             out_pil.save(buf, format="PNG")
@@ -533,6 +599,53 @@ else:
                 data=buf.getvalue(),
                 file_name="reconstructed.png",
                 mime="image/png",
+            )
+
+            # NEW: compressed download
+            st.subheader("Download a smaller compressed image (after modification)")
+            dl_u8 = maybe_downscale_u8(img_u8, max_side=int(dl_max_side))
+
+            fmt = dl_format.split()[0]
+            if fmt == "WEBP":
+                data = pil_save_bytes(
+                    dl_u8,
+                    "WEBP",
+                    quality=int(dl_quality),
+                    lossless=bool(dl_lossless_webp),
+                    method=6
+                )
+                out_name = "compressed.webp"
+                mime = "image/webp"
+            elif fmt == "JPEG":
+                data = pil_save_bytes(
+                    dl_u8,
+                    "JPEG",
+                    quality=int(dl_quality),
+                    optimize=True,
+                    progressive=True
+                )
+                out_name = "compressed.jpg"
+                mime = "image/jpeg"
+            else:
+                data = pil_save_bytes(
+                    dl_u8,
+                    "PNG",
+                    optimize=bool(dl_opt_png),
+                    compress_level=9
+                )
+                out_name = "compressed.png"
+                mime = "image/png"
+
+            d1, d2, d3 = st.columns(3)
+            d1.metric("Download image size", f"{dl_u8.shape[1]}×{dl_u8.shape[0]}")
+            d2.metric("File size", human_size(len(data)))
+            d3.metric("Format", fmt)
+
+            st.download_button(
+                "Download compressed image",
+                data=data,
+                file_name=out_name,
+                mime=mime,
             )
 
             st.subheader("Mathematical depiction")
