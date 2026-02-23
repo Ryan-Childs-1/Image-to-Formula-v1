@@ -1,4 +1,4 @@
-import os, glob, io, json, base64, zlib, math, time
+import os, glob, io, json, base64, zlib, math, time, hashlib
 from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
@@ -7,24 +7,43 @@ from PIL import Image
 
 
 # ============================================================
-# Stability defaults (prevents crashes)
+# Why your computer started crashing (and what we fix here)
+# ============================================================
+# In Streamlit, *every* widget change triggers a full rerun.
+# Your previous version was (re)building compressed download bytes on each rerun.
+# If the image is large, repeatedly encoding WEBP/JPEG/PNG can spike CPU + RAM and crash.
+#
+# Fixes implemented:
+# 1) "Generate formula" is now explicit (button/form submit). No heavy work on every rerun.
+# 2) Download bytes are built ONLY when user clicks "Prepare download".
+# 3) Results are stored in st.session_state, so changing UI doesn't recompute everything.
+# 4) Hard caps + pixel caps everywhere, plus byte-size guardrails.
+# 5) For large images, we downscale for download and show the resulting file size.
 # ============================================================
 
-# Hard limits to prevent runaway memory/CPU
-MAX_PIXELS_HARD = 6_000_000         # ~6 MP cap (e.g., 3000x2000). Adjust if needed.
-MAX_SIDE_HARD   = 2048              # cap resize max side in UI
-MAX_PALETTE_K   = 256               # Pillow limit
-NEAREST_CHUNK   = 25_000            # smaller chunk = lower peak RAM for fixed-palette nearest search
 
-# PIL safety (protect against decompression bombs)
-Image.MAX_IMAGE_PIXELS = 20_000_000  # allow up to 20MP, but we will still downscale/cap ourselves
+# ============================================================
+# Stability defaults / guardrails
+# ============================================================
+
+MAX_SIDE_HARD = 2048
+MAX_PIXELS_HARD = 6_000_000          # hard cap for working image (quantization/reconstruction)
+MAX_DOWNLOAD_PIXELS_HARD = 4_000_000 # hard cap for downloadable encode (save bytes)
+MAX_PALETTE_K = 256
+NEAREST_CHUNK = 25_000
+
+# Avoid decompression bombs (still downscale ourselves)
+Image.MAX_IMAGE_PIXELS = 20_000_000
+
+# Guardrail: refuse to hold absurdly large download blobs in memory
+MAX_DOWNLOAD_BYTES_IN_MEMORY = 60 * 1024 * 1024  # 60 MB
 
 
 # ============================================================
 # Formula container
 # ============================================================
 
-APP_FORMULA_PREFIX = "PALIMG_v2:"    # bumped version (safe changes)
+APP_FORMULA_PREFIX = "PALIMG_v3:"
 META_BYTES_SEP = b"\n\n--META/COEFF--\n\n"
 
 
@@ -66,16 +85,12 @@ def human_size(num_bytes: int) -> str:
 
 
 def safe_file_size_bytes_from_uploaded(upload_file) -> Optional[int]:
-    """
-    Streamlit UploadedFile has .size sometimes; otherwise we can read buffer length.
-    """
     if upload_file is None:
         return None
     sz = getattr(upload_file, "size", None)
     if isinstance(sz, int):
         return sz
     try:
-        # UploadedFile implements getvalue()
         return len(upload_file.getvalue())
     except Exception:
         return None
@@ -91,11 +106,6 @@ def safe_file_size_bytes_from_path(path: Optional[str]) -> Optional[int]:
 
 
 def load_image_from_choice(source_mode: str, chosen_local_path: Optional[str], upload_file) -> Tuple[np.ndarray, Dict[str, Any]]:
-    """
-    Returns:
-      img01_rgb: float32 [0,1] (H,W,3)
-      info: dict with original file size and original pixel dims
-    """
     info: Dict[str, Any] = {"source_mode": source_mode}
 
     if source_mode == "Local file":
@@ -109,70 +119,44 @@ def load_image_from_choice(source_mode: str, chosen_local_path: Optional[str], u
             arr = np.array(im)
         return to_float01(arr), info
 
-    else:
-        if upload_file is None:
-            raise ValueError("No image uploaded.")
-        info["upload_name"] = getattr(upload_file, "name", "upload")
-        info["orig_file_bytes"] = safe_file_size_bytes_from_uploaded(upload_file)
-        # Use file-like directly; do not .getvalue() unless needed
-        with Image.open(upload_file) as im:
-            im = im.convert("RGB")
-            info["orig_w"], info["orig_h"] = im.size
-            arr = np.array(im)
-        return to_float01(arr), info
+    if upload_file is None:
+        raise ValueError("No image uploaded.")
+    info["upload_name"] = getattr(upload_file, "name", "upload")
+    info["orig_file_bytes"] = safe_file_size_bytes_from_uploaded(upload_file)
+    with Image.open(upload_file) as im:
+        im = im.convert("RGB")
+        info["orig_w"], info["orig_h"] = im.size
+        arr = np.array(im)
+    return to_float01(arr), info
 
 
-def cap_resize_keep_aspect(img01_rgb: np.ndarray, max_side: int, max_pixels: int) -> np.ndarray:
-    """
-    Aggressive safety resize:
-      - First ensures max_side <= MAX_SIDE_HARD
-      - Ensures max(H,W) <= max_side
-      - Ensures H*W <= max_pixels
-    """
+def _scale_for_caps(H: int, W: int, max_side: int, max_pixels: int) -> float:
     max_side = int(min(max_side, MAX_SIDE_HARD))
-    H, W, _ = img01_rgb.shape
-
-    # Compute required scale based on side cap
     s1 = 1.0
     if max(H, W) > max_side:
         s1 = max_side / float(max(H, W))
-
-    # Compute required scale based on pixel cap
     s2 = 1.0
     if H * W > max_pixels:
         s2 = math.sqrt(max_pixels / float(H * W))
+    return min(s1, s2, 1.0)
 
-    scale = min(s1, s2, 1.0)
+
+def cap_resize_keep_aspect(img01_rgb: np.ndarray, max_side: int, max_pixels: int) -> np.ndarray:
+    H, W, _ = img01_rgb.shape
+    scale = _scale_for_caps(H, W, max_side=max_side, max_pixels=max_pixels)
     if scale >= 0.999:
         return img01_rgb
-
     newW = max(1, int(round(W * scale)))
     newH = max(1, int(round(H * scale)))
-
-    pil = Image.fromarray(to_uint8(img01_rgb), mode="RGB")
-    pil = pil.resize((newW, newH), Image.LANCZOS)
+    pil = Image.fromarray(to_uint8(img01_rgb), mode="RGB").resize((newW, newH), Image.LANCZOS)
     return to_float01(np.array(pil))
 
 
 def maybe_downscale_u8(img_u8: np.ndarray, max_side: int, max_pixels: int) -> np.ndarray:
-    """
-    Downscale uint8 for download / preview with pixel cap.
-    """
-    max_side = int(min(max_side, MAX_SIDE_HARD))
     H, W, _ = img_u8.shape
-
-    s1 = 1.0
-    if max(H, W) > max_side:
-        s1 = max_side / float(max(H, W))
-
-    s2 = 1.0
-    if H * W > max_pixels:
-        s2 = math.sqrt(max_pixels / float(H * W))
-
-    scale = min(s1, s2, 1.0)
+    scale = _scale_for_caps(H, W, max_side=max_side, max_pixels=max_pixels)
     if scale >= 0.999:
         return img_u8
-
     newW = max(1, int(round(W * scale)))
     newH = max(1, int(round(H * scale)))
     pil = Image.fromarray(img_u8, mode="RGB").resize((newW, newH), Image.LANCZOS)
@@ -186,14 +170,15 @@ def pil_save_bytes(img_u8: np.ndarray, fmt: str, **save_kwargs) -> bytes:
     return buf.getvalue()
 
 
+def stable_hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()[:16]
+
+
 # ============================================================
 # Binary formula encoding/decoding
 # ============================================================
 
 def pack_formula(meta: Dict[str, Any], coeff_bytes: bytes) -> str:
-    """
-    Single formula string = PREFIX + base64url(zlib(meta_json + SEP + coeff_bytes))
-    """
     meta_json = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     blob = meta_json + META_BYTES_SEP + coeff_bytes
     comp = zlib.compress(blob, level=9)
@@ -224,18 +209,12 @@ def unpack_formula(formula: str) -> Tuple[Dict[str, Any], bytes]:
 
 
 # ============================================================
-# Palette definitions (fixed)
+# Palettes
 # ============================================================
 
 def fixed_palette_rgb_u8(name: str) -> np.ndarray:
     if name == "GameBoy (4-color)":
-        return np.array([
-            [15, 56, 15],
-            [48, 98, 48],
-            [139, 172, 15],
-            [155, 188, 15],
-        ], dtype=np.uint8)
-
+        return np.array([[15, 56, 15],[48, 98, 48],[139, 172, 15],[155, 188, 15]], dtype=np.uint8)
     if name == "CGA 16":
         return np.array([
             [0,0,0],[0,0,170],[0,170,0],[0,170,170],
@@ -243,25 +222,20 @@ def fixed_palette_rgb_u8(name: str) -> np.ndarray:
             [85,85,85],[85,85,255],[85,255,85],[85,255,255],
             [255,85,85],[255,85,255],[255,255,85],[255,255,255],
         ], dtype=np.uint8)
-
     if name == "Grayscale 16":
         levels = np.linspace(0, 255, 16).round().astype(np.uint8)
         return np.stack([levels, levels, levels], axis=1)
-
     if name == "Grayscale 32":
         levels = np.linspace(0, 255, 32).round().astype(np.uint8)
         return np.stack([levels, levels, levels], axis=1)
-
     if name == "Web-safe 216":
         levels = np.array([0, 51, 102, 153, 204, 255], dtype=np.uint8)
-        pal = np.array([[r, g, b] for r in levels for g in levels for b in levels], dtype=np.uint8)
-        return pal
-
+        return np.array([[r,g,b] for r in levels for g in levels for b in levels], dtype=np.uint8)
     return fixed_palette_rgb_u8("CGA 16")
 
 
 # ============================================================
-# Bit-packing indices (major size win for small K)
+# Bitpacking indices
 # ============================================================
 
 def bits_needed(k: int) -> int:
@@ -274,15 +248,13 @@ def bits_needed(k: int) -> int:
 def pack_indices(indices: np.ndarray, bpp: int) -> bytes:
     bpp = int(bpp)
     idx = indices.astype(np.uint32, copy=False).ravel()
-
     out = bytearray()
     acc = 0
     acc_bits = 0
     mask = (1 << bpp) - 1
 
     for v in idx:
-        v = int(v) & mask
-        acc |= (v << acc_bits)
+        acc |= (int(v) & mask) << acc_bits
         acc_bits += bpp
         while acc_bits >= 8:
             out.append(acc & 0xFF)
@@ -291,7 +263,6 @@ def pack_indices(indices: np.ndarray, bpp: int) -> bytes:
 
     if acc_bits > 0:
         out.append(acc & 0xFF)
-
     return bytes(out)
 
 
@@ -313,53 +284,40 @@ def unpack_indices(packed: bytes, n: int, bpp: int) -> np.ndarray:
             i += 1
         if i >= n:
             break
-
     if i < n:
-        raise ValueError("Packed index stream ended early (corrupt formula).")
-
+        raise ValueError("Packed stream ended early (corrupt formula).")
     return out.astype(np.int32)
 
 
 # ============================================================
-# Quantization engines (bounded for safety)
+# Quantization (safer)
 # ============================================================
 
 def pil_adaptive_quantize(rgb_u8: np.ndarray, colors: int, dither: bool, method: str) -> Tuple[np.ndarray, np.ndarray]:
     pil = Image.fromarray(rgb_u8, mode="RGB")
-
     method_map = {"Median-cut": 0, "Fast Octree": 2, "Max Coverage": 1}
     m = method_map.get(method, 2)
     dith = Image.FLOYDSTEINBERG if dither else Image.NONE
-
-    # Pillow quantize returns "P" mode
     q = pil.quantize(colors=int(colors), method=m, dither=dith)
-    pal = np.array(q.getpalette(), dtype=np.uint8).reshape(-1, 3)
+    pal = np.array(q.getpalette(), dtype=np.uint8).reshape(-1, 3)  # 256x3
     idx = np.array(q, dtype=np.uint8)
-
     pal_eff = pal[:int(colors)].copy()
     return pal_eff, idx
 
 
 def nearest_palette_indices(rgb_u8: np.ndarray, palette_u8: np.ndarray) -> np.ndarray:
-    """
-    Bounded-memory nearest assignment.
-    Avoids huge intermediate arrays by chunking.
-    """
     H, W, _ = rgb_u8.shape
     X = rgb_u8.reshape(-1, 3).astype(np.int16, copy=False)
     P = palette_u8.astype(np.int16, copy=False)
-
     n = X.shape[0]
     out = np.zeros((n,), dtype=np.int32)
-
     chunk = int(NEAREST_CHUNK)
+
     for i0 in range(0, n, chunk):
         i1 = min(n, i0 + chunk)
         Xi = X[i0:i1]
-        # (chunk, K, 3) can still be heavy if K is large; but fixed palettes are <=216 here
         d2 = ((Xi[:, None, :] - P[None, :, :]) ** 2).sum(axis=2)
         out[i0:i1] = d2.argmin(axis=1)
-
     return out.reshape(H, W).astype(np.int32)
 
 
@@ -375,13 +333,11 @@ def encode_palette_image(
     palette_param: Dict[str, Any]
 ) -> Tuple[str, Dict[str, Any], np.ndarray]:
     """
-    Returns:
-      formula, meta, recon_u8 (reconstructed from the encoded data)
-    We reconstruct immediately to provide accurate compression stats + download.
+    Returns formula, meta, recon_u8 (reconstructed from encoded data).
     """
     t0 = time.time()
 
-    # Safety resize BEFORE quantization (big crash fix)
+    # Critical stability step: downscale BEFORE doing anything heavy
     img = cap_resize_keep_aspect(img01_rgb, max_side=int(max_side), max_pixels=int(max_pixels))
     rgb_u8 = to_uint8(img)
     H, W, _ = rgb_u8.shape
@@ -389,27 +345,25 @@ def encode_palette_image(
     if palette_mode == "Adaptive (Pillow)":
         k = int(palette_param.get("k", 32))
         k = max(2, min(k, MAX_PALETTE_K))
-        dither = bool(palette_param.get("dither", True))
         method = str(palette_param.get("method", "Fast Octree"))
+        dither = bool(palette_param.get("dither", True))
+
         palette_u8, idx_u8 = pil_adaptive_quantize(rgb_u8, colors=k, dither=dither, method=method)
         indices = idx_u8.astype(np.int32, copy=False)
 
         palette_name = None
-        palette_bytes = palette_u8.tobytes(order="C")
         palette_len = int(palette_u8.shape[0])
-
-        # clamp indices safely
         indices = np.clip(indices, 0, palette_len - 1)
+
+        palette_bytes = palette_u8.tobytes(order="C")
         k_eff = palette_len
 
     elif palette_mode == "Fixed Palette":
         palette_name = str(palette_param.get("name", "CGA 16"))
         palette_u8 = fixed_palette_rgb_u8(palette_name)
         k_eff = int(palette_u8.shape[0])
-        palette_bytes = b""
         palette_len = k_eff
-
-        # Fixed palette assignment can be expensive; we're chunked for safety
+        palette_bytes = b""
         indices = nearest_palette_indices(rgb_u8, palette_u8)
 
     else:
@@ -420,7 +374,7 @@ def encode_palette_image(
 
     meta = {
         "type": "palette_indexed_v1",
-        "version": 2,
+        "version": 3,
         "h": int(H),
         "w": int(W),
         "k": int(k_eff),
@@ -432,26 +386,22 @@ def encode_palette_image(
         "params": palette_param,
         "resized_pixels": int(H * W),
         "encode_seconds": float(time.time() - t0),
-        "notes": "Stability-hardened palette-indexed image + bit-packed indices + zlib.",
+        "notes": "Stable palette-indexed image + bit-packed indices + zlib. Heavy work only on button press.",
     }
 
     coeff_bytes = palette_bytes + packed_idx
     formula = pack_formula(meta, coeff_bytes)
 
-    # Reconstruct for preview/download/stats (no need to decompress formula again)
+    # recon from encoded data
     recon_u8 = palette_u8[np.clip(indices, 0, k_eff - 1)].reshape(H, W, 3).astype(np.uint8)
-
     return formula, meta, recon_u8
 
 
 def decode_palette_image(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray:
     if meta.get("type") != "palette_indexed_v1":
         raise ValueError(f"Unsupported type: {meta.get('type')}")
-
-    H = int(meta["h"])
-    W = int(meta["w"])
-    k = int(meta["k"])
-    bpp = int(meta["bpp"])
+    H = int(meta["h"]); W = int(meta["w"])
+    k = int(meta["k"]); bpp = int(meta["bpp"])
     palette_mode = meta.get("palette_mode", "Adaptive (Pillow)")
     palette_name = meta.get("palette_name", None)
     pal_bytes_len = int(meta.get("palette_bytes_len", 0))
@@ -459,28 +409,24 @@ def decode_palette_image(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray
     if palette_mode == "Adaptive (Pillow)":
         palette_bytes = coeff_bytes[:pal_bytes_len]
         packed_idx = coeff_bytes[pal_bytes_len:]
-        palette_u8 = np.frombuffer(palette_bytes, dtype=np.uint8)
         pal_len = int(meta.get("palette_len", k))
+        palette_u8 = np.frombuffer(palette_bytes, dtype=np.uint8)
         if palette_u8.size != pal_len * 3:
             raise ValueError("Palette bytes mismatch (corrupt formula).")
         palette_u8 = palette_u8.reshape(pal_len, 3)
         k = pal_len
-
     elif palette_mode == "Fixed Palette":
         palette_u8 = fixed_palette_rgb_u8(palette_name or "CGA 16")
         packed_idx = coeff_bytes
         k = int(palette_u8.shape[0])
         bpp = bits_needed(k)
-
     else:
         raise ValueError("Unknown palette_mode in formula.")
 
     n = H * W
     idx = unpack_indices(packed_idx, n=n, bpp=bpp)
     idx = np.clip(idx, 0, k - 1)
-
-    rgb = palette_u8[idx].reshape(H, W, 3).astype(np.uint8)
-    return rgb
+    return palette_u8[idx].reshape(H, W, 3).astype(np.uint8)
 
 
 def latex_palette_model() -> str:
@@ -496,19 +442,44 @@ def latex_palette_model() -> str:
 
 
 # ============================================================
-# Streamlit App
+# Session-state helpers (prevents recompute + prevents crashes)
 # ============================================================
 
-st.set_page_config(page_title="Image ⇄ Formula (Stable)", layout="wide")
-st.title("Image ⇄ Formula — Stable, Crash-Resistant, With Compression Stats")
+def ss_init():
+    st.session_state.setdefault("last_formula", None)
+    st.session_state.setdefault("last_meta", None)
+    st.session_state.setdefault("last_recon_u8", None)
+    st.session_state.setdefault("last_input_info", None)
+    st.session_state.setdefault("last_formula_bytes", None)
+    st.session_state.setdefault("last_download_blob", None)
+    st.session_state.setdefault("last_download_name", None)
+    st.session_state.setdefault("last_download_mime", None)
+    st.session_state.setdefault("last_download_sig", None)  # identifies which settings produced blob
+
+
+def ss_clear_download():
+    st.session_state["last_download_blob"] = None
+    st.session_state["last_download_name"] = None
+    st.session_state["last_download_mime"] = None
+    st.session_state["last_download_sig"] = None
+
+
+ss_init()
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+st.set_page_config(page_title="Image ⇄ Formula (Stable Downloads)", layout="wide")
+st.title("Image ⇄ Formula — Stable + Safe Download Compression (No More Crashes)")
 
 st.markdown(
-    "This version is hardened to avoid crashing:\n\n"
-    "- **Hard caps** on pixels and side-length (prevents runaway memory)\n"
-    "- **Chunked** nearest-palette computation\n"
-    "- Shows **original file size** + **compressed outputs** so you can see compression ratios\n"
-    "- Lets you download a **smaller compressed image** after modification\n"
+    "Key change: heavy work only happens when you click buttons.\n\n"
+    "- **Generate formula** (does the quantization + formula creation)\n"
+    "- **Prepare download** (builds WEBP/JPEG/PNG bytes once, then you can download)\n"
 )
+
 
 mode = st.radio("Choose conversion", ["Image → Formula", "Formula → Image"], horizontal=True)
 st.divider()
@@ -537,22 +508,20 @@ if mode == "Image → Formula":
             upload = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp", "bmp"])
 
         st.divider()
-        st.header("Safety caps (prevents crashes)")
-        # Users can LOWER caps if their machine is struggling
+        st.header("Safety caps (lower if your machine is struggling)")
         max_pixels = st.select_slider(
             "Max working pixels (H×W cap)",
-            options=[750_000, 1_500_000, 3_000_000, 6_000_000, 10_000_000],
-            value=min(MAX_PIXELS_HARD, 3_000_000)
+            options=[750_000, 1_500_000, 3_000_000, 6_000_000],
+            value=3_000_000
         )
-        st.caption("Lower this if your computer struggles. The app will downscale automatically.")
+        max_pixels = int(min(max_pixels, MAX_PIXELS_HARD))
 
-        st.divider()
-        st.header("Output resolution")
         max_side = st.select_slider(
             "Max side (preserve aspect)",
             options=[256, 384, 512, 768, 1024, 1280, 1536, 2048],
             value=1024
         )
+        max_side = int(min(max_side, MAX_SIDE_HARD))
 
         st.divider()
         st.header("Simplified color spectrum")
@@ -573,157 +542,195 @@ if mode == "Image → Formula":
             palette_param = {"name": name}
 
         st.divider()
-        st.header("Download smaller image")
+        st.header("Download settings (built only on button click)")
         dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0)
         dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768)
         dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1)
         dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True)
         dl_lossless_webp = st.checkbox("Lossless WEBP", value=False)
 
+        dl_max_side = int(min(dl_max_side, MAX_SIDE_HARD))
+
+        st.caption(
+            "Tip: WEBP at 70–85 quality is usually the best size/quality. "
+            "PNG can be huge; optimize helps but may be slow."
+        )
+
+    # Load input (cheap)
     try:
         img01, info = load_image_from_choice(source_mode, chosen_local, upload)
 
-        # Display original (but do NOT render gigantic images full-res)
-        st.subheader("Original image (input)")
+        st.subheader("Input overview")
+        c1, c2, c3 = st.columns(3)
+        orig_file_bytes = info.get("orig_file_bytes", None)
+        if isinstance(orig_file_bytes, int):
+            c1.metric("Original file size", human_size(orig_file_bytes))
+        else:
+            c1.metric("Original file size", "Unknown")
+        c2.metric("Original dimensions", f"{info.get('orig_w','?')}×{info.get('orig_h','?')}")
+        c3.metric("Source", info.get("upload_name") or os.path.basename(info.get("path", "")) or info.get("source_mode"))
+
         st.image(to_uint8(cap_resize_keep_aspect(img01, max_side=1024, max_pixels=1_500_000)), use_container_width=True)
 
-        # Compression stats: original file size + original dims
-        orig_file_bytes = info.get("orig_file_bytes", None)
-        orig_w = info.get("orig_w", None)
-        orig_h = info.get("orig_h", None)
+        # Heavy step only on submit:
+        with st.form("encode_form", clear_on_submit=False):
+            st.write("### Generate formula (heavy step)")
+            submitted = st.form_submit_button("Generate formula", type="primary")
 
-        # Encode safely (this is the heavy step)
-        with st.spinner("Encoding image into formula (bounded + crash-resistant)…"):
-            formula, meta, recon_u8 = encode_palette_image(
-                img01_rgb=img01,
-                max_side=int(max_side),
-                max_pixels=int(max_pixels),
-                palette_mode=palette_mode,
-                palette_param=palette_param,
-            )
+        if submitted:
+            ss_clear_download()
+            with st.spinner("Generating formula (bounded + safe)…"):
+                formula, meta, recon_u8 = encode_palette_image(
+                    img01_rgb=img01,
+                    max_side=max_side,
+                    max_pixels=max_pixels,
+                    palette_mode=palette_mode,
+                    palette_param=palette_param,
+                )
 
-        # Sizes
-        formula_bytes = len(formula.encode("utf-8"))
+            st.session_state["last_formula"] = formula
+            st.session_state["last_meta"] = meta
+            st.session_state["last_recon_u8"] = recon_u8
+            st.session_state["last_input_info"] = info
+            st.session_state["last_formula_bytes"] = len(formula.encode("utf-8"))
 
-        # Also compute a real compressed-image file size for apples-to-apples comparison
-        # (e.g., "what if I just saved this image as webp/jpeg?")
-        # We'll produce a default "comparison" export using WEBP quality 80 and same size as recon.
-        comp_webp = pil_save_bytes(recon_u8, "WEBP", quality=80, method=6)
-        comp_webp_bytes = len(comp_webp)
+        # If we have a last result, show it (no recompute)
+        if st.session_state["last_formula"] is not None:
+            formula = st.session_state["last_formula"]
+            meta = st.session_state["last_meta"]
+            recon_u8 = st.session_state["last_recon_u8"]
+            info0 = st.session_state["last_input_info"]
+            formula_bytes = st.session_state["last_formula_bytes"]
+            orig_file_bytes0 = info0.get("orig_file_bytes", None)
 
-        st.subheader("Compression summary")
-        a, b, c, d = st.columns(4)
-
-        if isinstance(orig_file_bytes, int):
-            a.metric("Original file size", human_size(orig_file_bytes))
-        else:
-            a.metric("Original file size", "Unknown")
-
-        b.metric("Working resolution", f"{meta['w']}×{meta['h']}")
-        c.metric("Formula size", human_size(formula_bytes))
-        d.metric("Encode time", f"{meta.get('encode_seconds', 0.0):.2f}s")
-
-        # Ratios
-        r1, r2 = st.columns(2)
-        with r1:
-            if isinstance(orig_file_bytes, int) and orig_file_bytes > 0:
-                ratio = orig_file_bytes / float(formula_bytes)
-                st.metric("Orig / Formula ratio", f"{ratio:.2f}×")
+            st.divider()
+            st.subheader("Compression summary (last generated)")
+            a, b, c, d = st.columns(4)
+            if isinstance(orig_file_bytes0, int):
+                a.metric("Original file size", human_size(orig_file_bytes0))
             else:
-                st.metric("Orig / Formula ratio", "—")
-        with r2:
-            if isinstance(orig_file_bytes, int) and orig_file_bytes > 0:
-                ratio2 = orig_file_bytes / float(comp_webp_bytes)
-                st.metric("Orig / WEBP(80) ratio", f"{ratio2:.2f}×")
+                a.metric("Original file size", "Unknown")
+            b.metric("Working resolution", f"{meta['w']}×{meta['h']}")
+            c.metric("Formula size", human_size(formula_bytes))
+            d.metric("Encode time", f"{meta.get('encode_seconds', 0.0):.2f}s")
+
+            r1, r2 = st.columns(2)
+            with r1:
+                if isinstance(orig_file_bytes0, int) and orig_file_bytes0 > 0:
+                    r1.metric("Orig / Formula ratio", f"{orig_file_bytes0/float(formula_bytes):.2f}×")
+                else:
+                    r1.metric("Orig / Formula ratio", "—")
+            with r2:
+                # A realistic baseline: WEBP(80) for the *same palette image* (not the original)
+                base_webp = pil_save_bytes(recon_u8, "WEBP", quality=80, method=6)
+                if isinstance(orig_file_bytes0, int) and orig_file_bytes0 > 0:
+                    r2.metric("Orig / WEBP(80) ratio", f"{orig_file_bytes0/float(len(base_webp)):.2f}×")
+                else:
+                    r2.metric("WEBP(80) size", human_size(len(base_webp)))
+
+            st.subheader("Single formula string")
+            st.text_area("Copy/paste this formula:", value=formula, height=220)
+
+            st.download_button(
+                "Download formula as .txt",
+                data=formula.encode("utf-8"),
+                file_name="image_formula.txt",
+                mime="text/plain",
+            )
+
+            st.subheader("Reconstructed preview (palette result)")
+            st.image(maybe_downscale_u8(recon_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
+
+            st.subheader("Prepare downloadable compressed image (built only when you click)")
+            # Signature identifies whether download settings changed since blob built
+            sig_src = f"{meta['w']}x{meta['h']}|{dl_format}|{dl_max_side}|{dl_quality}|{dl_opt_png}|{dl_lossless_webp}"
+            sig = stable_hash_bytes(sig_src.encode("utf-8"))
+
+            colp1, colp2 = st.columns([1, 1])
+            with colp1:
+                prep = st.button("Prepare download", type="secondary")
+            with colp2:
+                st.caption("This step compresses the image file (WEBP/JPEG/PNG). It can take a moment for large images.")
+
+            if prep:
+                ss_clear_download()
+                with st.spinner("Building compressed download…"):
+                    # Downscale for download with additional hard cap
+                    dl_u8 = maybe_downscale_u8(
+                        recon_u8,
+                        max_side=int(dl_max_side),
+                        max_pixels=min(int(max_pixels), MAX_DOWNLOAD_PIXELS_HARD)
+                    )
+
+                    fmt = dl_format.split()[0]
+                    if fmt == "WEBP":
+                        blob = pil_save_bytes(
+                            dl_u8, "WEBP",
+                            quality=int(dl_quality),
+                            lossless=bool(dl_lossless_webp),
+                            method=6
+                        )
+                        name = "modified_compressed.webp"
+                        mime = "image/webp"
+                    elif fmt == "JPEG":
+                        blob = pil_save_bytes(
+                            dl_u8, "JPEG",
+                            quality=int(dl_quality),
+                            optimize=True,
+                            progressive=True
+                        )
+                        name = "modified_compressed.jpg"
+                        mime = "image/jpeg"
+                    else:
+                        # PNG can be huge; keep, but guardrail the memory
+                        blob = pil_save_bytes(
+                            dl_u8, "PNG",
+                            optimize=bool(dl_opt_png),
+                            compress_level=9
+                        )
+                        name = "modified_compressed.png"
+                        mime = "image/png"
+
+                    if len(blob) > MAX_DOWNLOAD_BYTES_IN_MEMORY:
+                        # Prevent memory blowups / browser issues
+                        raise RuntimeError(
+                            f"Download file is too large to hold in memory ({human_size(len(blob))}). "
+                            f"Lower download max side or choose WEBP/JPEG."
+                        )
+
+                    st.session_state["last_download_blob"] = blob
+                    st.session_state["last_download_name"] = name
+                    st.session_state["last_download_mime"] = mime
+                    st.session_state["last_download_sig"] = sig
+
+            # Show download button only if prepared and settings match
+            if st.session_state["last_download_blob"] is not None and st.session_state["last_download_sig"] == sig:
+                blob = st.session_state["last_download_blob"]
+                name = st.session_state["last_download_name"]
+                mime = st.session_state["last_download_mime"]
+
+                d1, d2, d3 = st.columns(3)
+                d1.metric("Prepared download size", human_size(len(blob)))
+                d2.metric("Download format", dl_format.split()[0])
+                if isinstance(orig_file_bytes0, int) and orig_file_bytes0 > 0:
+                    d3.metric("Orig / Download ratio", f"{orig_file_bytes0/float(len(blob)):.2f}×")
+                else:
+                    d3.metric("Orig / Download ratio", "—")
+
+                st.download_button(
+                    "Download compressed modified image",
+                    data=blob,
+                    file_name=name,
+                    mime=mime,
+                )
             else:
-                st.metric("Orig / WEBP(80) ratio", "—")
+                st.info("Click **Prepare download** to generate the compressed file, then the download button will appear.")
 
-        st.caption(
-            "Note: compression ratios depend on the original file format/quality. "
-            "A high-quality PNG may be much larger than an equivalently-sized WEBP/JPEG."
-        )
+            st.subheader("Mathematical depiction")
+            st.latex(latex_palette_model())
 
-        # Formula output
-        st.subheader("Single formula string")
-        st.text_area("Copy/paste this formula:", value=formula, height=220)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Palette K", str(meta["k"]))
-        c2.metric("Bits/pixel", str(meta["bpp"]))
-        c3.metric("Palette mode", meta["palette_mode"])
-        c4.metric("Pixel cap used", f"{int(max_pixels):,}")
-
-        st.subheader("Mathematical depiction")
-        st.latex(latex_palette_model())
-
-        # Preview reconstruction (bounded display)
-        st.subheader("Reconstructed preview (from encoded data)")
-        preview_u8 = maybe_downscale_u8(recon_u8, max_side=1024, max_pixels=1_500_000)
-        st.image(preview_u8, use_container_width=True)
-
-        st.download_button(
-            "Download formula as .txt",
-            data=formula.encode("utf-8"),
-            file_name="image_formula.txt",
-            mime="text/plain",
-        )
-
-        # NEW: Download compressed modified image with user-selected options
-        st.subheader("Download a smaller compressed image (modified)")
-
-        dl_u8 = maybe_downscale_u8(recon_u8, max_side=int(dl_max_side), max_pixels=int(max_pixels))
-
-        fmt = dl_format.split()[0]  # WEBP/JPEG/PNG
-        if fmt == "WEBP":
-            data = pil_save_bytes(
-                dl_u8,
-                "WEBP",
-                quality=int(dl_quality),
-                lossless=bool(dl_lossless_webp),
-                method=6
-            )
-            out_name = "modified_compressed.webp"
-            mime = "image/webp"
-        elif fmt == "JPEG":
-            data = pil_save_bytes(
-                dl_u8,
-                "JPEG",
-                quality=int(dl_quality),
-                optimize=True,
-                progressive=True
-            )
-            out_name = "modified_compressed.jpg"
-            mime = "image/jpeg"
-        else:
-            data = pil_save_bytes(
-                dl_u8,
-                "PNG",
-                optimize=bool(dl_opt_png),
-                compress_level=9
-            )
-            out_name = "modified_compressed.png"
-            mime = "image/png"
-
-        e1, e2, e3 = st.columns(3)
-        e1.metric("Download image size", f"{dl_u8.shape[1]}×{dl_u8.shape[0]}")
-        e2.metric("Download file size", human_size(len(data)))
-        if isinstance(orig_file_bytes, int) and orig_file_bytes > 0:
-            e3.metric("Orig / Download ratio", f"{orig_file_bytes/float(len(data)):.2f}×")
-        else:
-            e3.metric("Orig / Download ratio", "—")
-
-        st.download_button(
-            "Download compressed modified image",
-            data=data,
-            file_name=out_name,
-            mime=mime,
-        )
-
-        with st.expander("Show details (meta + input info)"):
-            st.json({"input_info": info, "meta": meta})
-
-        if isinstance(orig_w, int) and isinstance(orig_h, int):
-            st.caption(f"Original pixel dimensions: {orig_w}×{orig_h}")
+            with st.expander("Show meta + input info"):
+                st.json({"input_info": info0, "meta": meta})
 
     except Exception as e:
         st.error(f"Image → Formula failed: {e}")
@@ -737,86 +744,101 @@ else:
     st.subheader("Paste a formula string to reconstruct the image")
     formula_in = st.text_area("Formula", height=220, placeholder=f"{APP_FORMULA_PREFIX}...")
 
-    st.markdown("### Download options (after reconstruction)")
-    dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="dl_fmt_2")
-    dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="dl_side_2")
-    dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="dl_q_2")
-    dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="dl_png_2")
-    dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="dl_webp_lossless_2")
+    st.markdown("### Download settings (built only on button click)")
+    dl_format = st.selectbox("File format", ["WEBP", "JPEG", "PNG (optimized)"], index=0, key="f2_fmt")
+    dl_max_side = st.select_slider("Download max side", options=[256, 384, 512, 768, 1024, 1280, 1536, 2048], value=768, key="f2_side")
+    dl_quality = st.slider("Quality (WEBP/JPEG)", min_value=10, max_value=95, value=80, step=1, key="f2_q")
+    dl_opt_png = st.checkbox("Optimize PNG (slower)", value=True, key="f2_png")
+    dl_lossless_webp = st.checkbox("Lossless WEBP", value=False, key="f2_webp_lossless")
 
-    if st.button("Reconstruct image", type="primary"):
+    colA, colB = st.columns([1, 2])
+    with colA:
+        do_recon = st.button("Reconstruct image", type="primary")
+    with colB:
+        st.caption("Reconstruction is usually fast. Download compression happens only when you click Prepare download.")
+
+    if do_recon:
         try:
+            ss_clear_download()
             with st.spinner("Decoding formula…"):
                 meta, coeff = unpack_formula(formula_in)
                 img_u8 = decode_palette_image(meta, coeff)
 
+            st.session_state["last_recon_u8"] = img_u8
+            st.session_state["last_meta"] = meta
+
             st.success(f"Reconstructed {meta['w']}×{meta['h']} | K={meta['k']} | bpp={meta['bpp']} | {meta['palette_mode']}")
+            st.image(maybe_downscale_u8(img_u8, max_side=1024, max_pixels=1_500_000), use_container_width=True)
 
-            preview_u8 = maybe_downscale_u8(img_u8, max_side=1024, max_pixels=1_500_000)
-            st.image(preview_u8, use_container_width=True)
-
-            # Original reconstructed PNG download (lossless)
-            out_pil = Image.fromarray(img_u8, mode="RGB")
-            buf = io.BytesIO()
-            out_pil.save(buf, format="PNG")
-            st.download_button(
-                "Download reconstructed PNG (lossless)",
-                data=buf.getvalue(),
-                file_name="reconstructed.png",
-                mime="image/png",
-            )
-
-            # NEW: compressed download
-            st.subheader("Download a smaller compressed image")
-            dl_u8 = maybe_downscale_u8(img_u8, max_side=int(dl_max_side), max_pixels=MAX_PIXELS_HARD)
-
-            fmt = dl_format.split()[0]
-            if fmt == "WEBP":
-                data = pil_save_bytes(
-                    dl_u8,
-                    "WEBP",
-                    quality=int(dl_quality),
-                    lossless=bool(dl_lossless_webp),
-                    method=6
-                )
-                out_name = "compressed.webp"
-                mime = "image/webp"
-            elif fmt == "JPEG":
-                data = pil_save_bytes(
-                    dl_u8,
-                    "JPEG",
-                    quality=int(dl_quality),
-                    optimize=True,
-                    progressive=True
-                )
-                out_name = "compressed.jpg"
-                mime = "image/jpeg"
+            # Always provide lossless PNG download (small enough usually; still can be big)
+            png_blob = pil_save_bytes(img_u8, "PNG", optimize=True, compress_level=9)
+            if len(png_blob) <= MAX_DOWNLOAD_BYTES_IN_MEMORY:
+                st.download_button("Download reconstructed PNG (lossless)", data=png_blob, file_name="reconstructed.png", mime="image/png")
             else:
-                data = pil_save_bytes(
-                    dl_u8,
-                    "PNG",
-                    optimize=bool(dl_opt_png),
-                    compress_level=9
-                )
-                out_name = "compressed.png"
-                mime = "image/png"
-
-            d1, d2 = st.columns(2)
-            d1.metric("Download image size", f"{dl_u8.shape[1]}×{dl_u8.shape[0]}")
-            d2.metric("Download file size", human_size(len(data)))
-
-            st.download_button(
-                "Download compressed image",
-                data=data,
-                file_name=out_name,
-                mime=mime,
-            )
-
-            st.subheader("Mathematical depiction")
-            st.latex(latex_palette_model())
-
-            with st.expander("Show decoded meta"):
-                st.json(meta)
+                st.warning(f"Lossless PNG is too large to offer directly ({human_size(len(png_blob))}). Use WEBP/JPEG download below.")
 
         except Exception as e:
             st.error(f"Formula → Image failed: {e}")
+
+    # If we have a reconstructed image in session, allow download prep
+    if st.session_state.get("last_recon_u8") is not None and st.session_state.get("last_meta") is not None:
+        img_u8 = st.session_state["last_recon_u8"]
+        meta = st.session_state["last_meta"]
+
+        st.divider()
+        st.subheader("Prepare compressed download")
+
+        sig_src = f"{meta['w']}x{meta['h']}|{dl_format}|{dl_max_side}|{dl_quality}|{dl_opt_png}|{dl_lossless_webp}"
+        sig = stable_hash_bytes(sig_src.encode("utf-8"))
+
+        prep = st.button("Prepare download", key="f2_prep")
+        if prep:
+            ss_clear_download()
+            try:
+                with st.spinner("Building compressed download…"):
+                    dl_u8 = maybe_downscale_u8(img_u8, max_side=int(dl_max_side), max_pixels=MAX_DOWNLOAD_PIXELS_HARD)
+                    fmt = dl_format.split()[0]
+                    if fmt == "WEBP":
+                        blob = pil_save_bytes(dl_u8, "WEBP", quality=int(dl_quality), lossless=bool(dl_lossless_webp), method=6)
+                        name = "compressed.webp"
+                        mime = "image/webp"
+                    elif fmt == "JPEG":
+                        blob = pil_save_bytes(dl_u8, "JPEG", quality=int(dl_quality), optimize=True, progressive=True)
+                        name = "compressed.jpg"
+                        mime = "image/jpeg"
+                    else:
+                        blob = pil_save_bytes(dl_u8, "PNG", optimize=bool(dl_opt_png), compress_level=9)
+                        name = "compressed.png"
+                        mime = "image/png"
+
+                    if len(blob) > MAX_DOWNLOAD_BYTES_IN_MEMORY:
+                        raise RuntimeError(
+                            f"Download file is too large to hold in memory ({human_size(len(blob))}). "
+                            f"Lower download max side or choose WEBP/JPEG."
+                        )
+
+                    st.session_state["last_download_blob"] = blob
+                    st.session_state["last_download_name"] = name
+                    st.session_state["last_download_mime"] = mime
+                    st.session_state["last_download_sig"] = sig
+            except Exception as e:
+                st.error(f"Prepare download failed: {e}")
+
+        if st.session_state.get("last_download_blob") is not None and st.session_state.get("last_download_sig") == sig:
+            blob = st.session_state["last_download_blob"]
+            name = st.session_state["last_download_name"]
+            mime = st.session_state["last_download_mime"]
+
+            d1, d2 = st.columns(2)
+            d1.metric("Prepared download size", human_size(len(blob)))
+            d2.metric("Format", dl_format.split()[0])
+
+            st.download_button("Download compressed image", data=blob, file_name=name, mime=mime)
+        else:
+            st.info("Click **Prepare download** to generate the compressed file, then the download button will appear.")
+
+        st.subheader("Mathematical depiction")
+        st.latex(latex_palette_model())
+
+        with st.expander("Show decoded meta"):
+            st.json(meta)
