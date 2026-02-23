@@ -1,9 +1,4 @@
-import os
-import glob
-import io
-import json
-import base64
-import zlib
+import os, glob, io, json, base64, zlib
 from typing import Dict, Any, Optional, List, Tuple
 
 import numpy as np
@@ -15,8 +10,9 @@ from PIL import Image
 # Formula container
 # ============================================================
 
-APP_FORMULA_PREFIX = "IMGFORM_v2:"  # single-string formula prefix
+APP_FORMULA_PREFIX = "IMGFORM_v3:"  # NEW version
 META_BYTES_SEP = b"\n\n--META/COEFF--\n\n"
+
 
 # ============================================================
 # Utilities
@@ -56,15 +52,9 @@ def load_image_from_choice(source_mode: str, chosen_local_path: Optional[str], u
         return to_float01(np.array(img))
 
 
-def resize_keep_aspect_and_pad(img01_rgb: np.ndarray, max_side: int, pad_multiple: int) -> Tuple[np.ndarray, Dict[str, int]]:
-    """
-    Resize so max(H,W)=max_side while preserving aspect ratio.
-    Then pad to multiples of pad_multiple (for tiling).
-    Returns padded image and meta describing original/padded shapes.
-    """
+def resize_keep_aspect(img01_rgb: np.ndarray, max_side: int) -> np.ndarray:
     H, W, _ = img01_rgb.shape
     max_side = int(max_side)
-
     if max(H, W) > max_side:
         scale = max_side / float(max(H, W))
         newW = max(1, int(round(W * scale)))
@@ -74,39 +64,7 @@ def resize_keep_aspect_and_pad(img01_rgb: np.ndarray, max_side: int, pad_multipl
 
     pil = Image.fromarray(to_uint8(img01_rgb), mode="RGB")
     pil = pil.resize((newW, newH), Image.LANCZOS)
-    resized = to_float01(np.array(pil))
-
-    rH, rW, _ = resized.shape
-
-    # pad to multiple
-    def up_to_mult(n, m):
-        return ((n + m - 1) // m) * m
-
-    pH = up_to_mult(rH, pad_multiple)
-    pW = up_to_mult(rW, pad_multiple)
-
-    pad_bottom = pH - rH
-    pad_right = pW - rW
-
-    padded = np.pad(
-        resized,
-        ((0, pad_bottom), (0, pad_right), (0, 0)),
-        mode="edge"
-    )
-
-    meta = {
-        "orig_h": int(H),
-        "orig_w": int(W),
-        "res_h": int(rH),
-        "res_w": int(rW),
-        "pad_h": int(pH),
-        "pad_w": int(pW),
-    }
-    return padded, meta
-
-
-def crop_to_resized(img01_rgb: np.ndarray, res_h: int, res_w: int) -> np.ndarray:
-    return img01_rgb[:res_h, :res_w, :]
+    return to_float01(np.array(pil))
 
 
 def human_size(num_bytes: int) -> str:
@@ -125,9 +83,6 @@ def human_size(num_bytes: int) -> str:
 # ============================================================
 
 def pack_formula(meta: Dict[str, Any], coeff_bytes: bytes) -> str:
-    """
-    Single formula string = PREFIX + base64url(zlib( meta_json + SEP + coeff_bytes ))
-    """
     meta_json = json.dumps(meta, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     blob = meta_json + META_BYTES_SEP + coeff_bytes
     comp = zlib.compress(blob, level=9)
@@ -139,8 +94,8 @@ def unpack_formula(formula: str) -> Tuple[Dict[str, Any], bytes]:
     s = (formula or "").strip()
     if not s.startswith(APP_FORMULA_PREFIX):
         raise ValueError(f"Formula must start with '{APP_FORMULA_PREFIX}'")
-
     b64 = s[len(APP_FORMULA_PREFIX):].strip()
+
     try:
         comp = base64.urlsafe_b64decode(b64.encode("ascii"))
         blob = zlib.decompress(comp)
@@ -153,371 +108,403 @@ def unpack_formula(formula: str) -> Tuple[Dict[str, Any], bytes]:
 
     meta_json = blob[:sep_idx]
     coeff_bytes = blob[sep_idx + len(META_BYTES_SEP):]
-
-    try:
-        meta = json.loads(meta_json.decode("utf-8"))
-    except Exception as e:
-        raise ValueError(f"Invalid meta JSON: {e}")
-
+    meta = json.loads(meta_json.decode("utf-8"))
     return meta, coeff_bytes
 
 
 # ============================================================
-# Global Fourier representation (improved)
+# Color space helpers (YCbCr) for smaller base
 # ============================================================
 
-def fft2_truncate_center(chan01: np.ndarray, keep: int) -> np.ndarray:
+def rgb_to_ycbcr(rgb01: np.ndarray) -> np.ndarray:
+    # rgb01: float [0,1]
+    r, g, b = rgb01[..., 0], rgb01[..., 1], rgb01[..., 2]
+    y  = 0.299*r + 0.587*g + 0.114*b
+    cb = -0.168736*r - 0.331264*g + 0.5*b + 0.5
+    cr = 0.5*r - 0.418688*g - 0.081312*b + 0.5
+    return np.stack([y, cb, cr], axis=-1).astype(np.float32)
+
+
+def ycbcr_to_rgb(ycc01: np.ndarray) -> np.ndarray:
+    y, cb, cr = ycc01[..., 0], ycc01[..., 1] - 0.5, ycc01[..., 2] - 0.5
+    r = y + 1.402*cr
+    g = y - 0.344136*cb - 0.714136*cr
+    b = y + 1.772*cb
+    return np.clip(np.stack([r, g, b], axis=-1), 0.0, 1.0).astype(np.float32)
+
+
+def downsample_mean(img: np.ndarray, factor: int) -> np.ndarray:
+    # img: (H,W,C)
+    H, W, C = img.shape
+    f = int(factor)
+    H2 = (H // f) * f
+    W2 = (W // f) * f
+    img = img[:H2, :W2, :]
+    img = img.reshape(H2//f, f, W2//f, f, C).mean(axis=(1,3))
+    return img
+
+
+def upsample_bilinear(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    pil = Image.fromarray(to_uint8(img), mode="RGB")
+    pil = pil.resize((out_w, out_h), Image.BILINEAR)
+    return to_float01(np.array(pil))
+
+
+# ============================================================
+# Novel representation: Edge + Brushstroke Field (EBF)
+# ============================================================
+
+def sobel_edges(gray: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns centered keep×keep complex block from fftshift(fft2(chan)).
+    gray: (H,W) float
+    Returns: gx, gy, mag
     """
-    N0, N1 = chan01.shape
-    if N0 != N1:
-        raise ValueError("Global FFT mode requires square input internally.")
-    N = N0
-    keep = int(keep)
-    if keep < 1 or keep > N:
-        raise ValueError("keep must be between 1 and N.")
+    kx = np.array([[-1, 0, 1],
+                   [-2, 0, 2],
+                   [-1, 0, 1]], dtype=np.float32)
+    ky = np.array([[-1,-2,-1],
+                   [ 0, 0, 0],
+                   [ 1, 2, 1]], dtype=np.float32)
 
-    F = np.fft.fft2(chan01)
-    Fs = np.fft.fftshift(F)
+    def conv2(a, k):
+        H, W = a.shape
+        ap = np.pad(a, ((1,1),(1,1)), mode="edge")
+        out = np.zeros((H,W), dtype=np.float32)
+        for i in range(3):
+            for j in range(3):
+                out += k[i,j] * ap[i:i+H, j:j+W]
+        return out
 
-    c = N // 2
-    half = keep // 2
-    r0 = c - half
-    r1 = r0 + keep
-    return Fs[r0:r1, r0:r1].astype(np.complex64)
+    gx = conv2(gray, kx)
+    gy = conv2(gray, ky)
+    mag = np.sqrt(gx*gx + gy*gy)
+    return gx, gy, mag
 
 
-def ifft2_from_center_block(N: int, keep: int, block: np.ndarray) -> np.ndarray:
+def pick_sparse_points(mag: np.ndarray, K: int, min_dist: int, seed: int = 0) -> np.ndarray:
     """
-    Reconstruct approx channel from keep×keep centered frequency block.
+    Greedy non-maximum selection on gradient magnitude.
+    Returns array of (y,x) points length <=K.
     """
-    N = int(N)
-    keep = int(keep)
-    if block.shape != (keep, keep):
-        raise ValueError(f"Block shape {block.shape} != ({keep},{keep})")
+    rng = np.random.default_rng(seed)
+    H, W = mag.shape
+    flat_idx = np.argsort(mag.reshape(-1))[::-1]  # descending
+    selected = []
+    blocked = np.zeros((H,W), dtype=bool)
 
-    Fs = np.zeros((N, N), dtype=np.complex64)
-    c = N // 2
-    half = keep // 2
-    r0 = c - half
-    r1 = r0 + keep
-    Fs[r0:r1, r0:r1] = block
+    r = int(min_dist)
+    for idx in flat_idx:
+        if len(selected) >= K:
+            break
+        y = int(idx // W)
+        x = int(idx %  W)
+        if blocked[y, x]:
+            continue
+        if mag[y, x] <= 1e-6:
+            break
+        selected.append((y, x))
 
-    F = np.fft.ifftshift(Fs)
-    out = np.fft.ifft2(F).real.astype(np.float32)
-    return np.clip(out, 0.0, 1.0)
+        y0 = max(0, y - r)
+        y1 = min(H, y + r + 1)
+        x0 = max(0, x - r)
+        x1 = min(W, x + r + 1)
+        blocked[y0:y1, x0:x1] = True
+
+    # slight shuffle to avoid visible ordering artifacts when rendering
+    rng.shuffle(selected)
+    return np.array(selected, dtype=np.int32)
 
 
-def image_to_formula_global_fft(img01_rgb: np.ndarray, max_side: int, keep: int) -> Tuple[str, Dict[str, Any]]:
+def render_brushstrokes(
+    base_ycc: np.ndarray,
+    strokes: np.ndarray,
+    out_h: int,
+    out_w: int,
+    sharpen: float
+) -> np.ndarray:
     """
-    Convert image -> formula (global FFT).
-    Internally we use a square canvas to keep FFT definition simple:
-    - resize keep-aspect to max_side, then pad to square (max of dims).
-    - store crop info.
+    base_ycc: (H,W,3) float base already upsampled to out_h/out_w in YCbCr.
+    strokes: (K, 8) float32: [x, y, theta, ampY, ampCb, ampCr, sig_par, sig_perp]
+      x,y in [0,1], theta in radians, amps in [-1,1] approx, sig in normalized units.
+    Adds anisotropic gaussian-derivative-like strokes.
     """
-    # Make pad_multiple = 1 for global
-    padded, shape_meta = resize_keep_aspect_and_pad(img01_rgb, max_side=max_side, pad_multiple=1)
+    ycc = base_ycc.copy()
+    H, W, _ = ycc.shape
 
-    # pad to square
-    H, W, _ = padded.shape
-    N = max(H, W)
-    if H != W:
-        pad_bottom = N - H
-        pad_right = N - W
-        padded = np.pad(padded, ((0, pad_bottom), (0, pad_right), (0, 0)), mode="edge")
-    else:
-        pad_bottom = 0
-        pad_right = 0
+    # precompute coordinate grid in [0,1]
+    yy = (np.arange(H, dtype=np.float32) + 0.5) / H
+    xx = (np.arange(W, dtype=np.float32) + 0.5) / W
+    Y, X = np.meshgrid(yy, xx, indexing="ij")  # (H,W)
 
-    keep = int(keep)
-    if keep > N:
-        keep = N
+    # add strokes
+    for s in strokes:
+        x0, y0, th, aY, aCb, aCr, sp, sn = s
+        # rotate coordinates around (x0,y0)
+        dx = X - x0
+        dy = Y - y0
+        c = np.cos(th); si = np.sin(th)
+        u =  c*dx + si*dy
+        v = -si*dx + c*dy
 
-    blocks = []
-    for ch in range(3):
-        block = fft2_truncate_center(padded[:, :, ch], keep=keep)
-        # store as float16 (real, imag)
-        bi = np.stack([block.real, block.imag], axis=-1).astype(np.float16)  # (keep, keep, 2)
-        blocks.append(bi)
+        # anisotropic gaussian envelope
+        sp = max(float(sp), 1e-4)
+        sn = max(float(sn), 1e-4)
+        g = np.exp(-0.5*((u/sp)**2 + (v/sn)**2)).astype(np.float32)
 
-    coeff = np.stack(blocks, axis=0)  # (3, keep, keep, 2)
-    coeff_bytes = coeff.tobytes(order="C")
+        # "edge-like" stroke: derivative along v (perp) gives crisp line
+        # d/dv gaussian ~ -(v/sn^2)*g
+        stroke = (-v/(sn*sn)) * g
+
+        ycc[..., 0] = np.clip(ycc[..., 0] + aY  * stroke, 0.0, 1.0)
+        ycc[..., 1] = np.clip(ycc[..., 1] + aCb * stroke, 0.0, 1.0)
+        ycc[..., 2] = np.clip(ycc[..., 2] + aCr * stroke, 0.0, 1.0)
+
+    # optional deterministic sharpening on luminance only (no bytes)
+    if sharpen > 0:
+        y = ycc[..., 0]
+        # unsharp mask: y + k*(y - blur(y))
+        # cheap blur:
+        yp = np.pad(y, ((1,1),(1,1)), mode="edge")
+        blur = (
+            yp[0:H,0:W] + yp[0:H,1:W+1] + yp[0:H,2:W+2] +
+            yp[1:H+1,0:W] + yp[1:H+1,1:W+1] + yp[1:H+1,2:W+2] +
+            yp[2:H+2,0:W] + yp[2:H+2,1:W+1] + yp[2:H+2,2:W+2]
+        ) / 9.0
+        y = np.clip(y + float(sharpen) * (y - blur), 0.0, 1.0)
+        ycc[..., 0] = y
+
+    return ycc
+
+
+def encode_edge_brush(
+    img01_rgb: np.ndarray,
+    max_side: int,
+    base_factor: int,
+    K: int,
+    min_dist_px: int,
+    quant_bits: int,
+    sharpen: float,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Encode:
+      - Resize image to max_side
+      - Convert to YCbCr
+      - Base: downsample by base_factor, store as uint8 (or uint6/uint5 packed) in bytes
+      - Strokes: pick K edge points on luminance gradient, store params in quantized int16
+    """
+    img = resize_keep_aspect(img01_rgb, max_side=max_side)
+    H, W, _ = img.shape
+
+    ycc = rgb_to_ycbcr(img)
+    y = ycc[..., 0]
+
+    # base low-res field (YCbCr then stored compactly)
+    base_factor = int(base_factor)
+    base = downsample_mean(ycc, factor=base_factor)  # (Hb,Wb,3)
+    Hb, Wb, _ = base.shape
+
+    # edge selection on luminance
+    gx, gy, mag = sobel_edges(y)
+    pts = pick_sparse_points(mag, K=int(K), min_dist=int(min_dist_px))
+
+    # build stroke parameters
+    # normalize coordinates to [0,1]
+    strokes = []
+    for (py, px) in pts:
+        # angle of edge normal/perp; we want stroke aligned along edge tangent
+        ang = np.arctan2(gy[py, px], gx[py, px])  # gradient direction
+        theta = ang + np.pi/2  # tangent direction
+
+        # amplitude based on local contrast: sample difference across gradient direction
+        # simple: scale by mag
+        amp = float(mag[py, px])
+        # normalize amp into manageable range
+        amp = np.tanh(amp * 0.75)
+
+        # color residual at that point (difference from upsampled base)
+        # upsample base to full to estimate residual
+        # (do once outside loop for speed)
+        strokes.append((py, px, theta, amp))
+
+    # upsample base to compute residual colors
+    base_rgb_low = ycbcr_to_rgb(base)
+    base_rgb_full = upsample_bilinear(base_rgb_low, out_h=H, out_w=W)
+    base_ycc_full = rgb_to_ycbcr(base_rgb_full)
+
+    stroke_arr = np.zeros((len(pts), 8), dtype=np.float32)
+    for i, (py, px, theta, amp) in enumerate(strokes):
+        x0 = (px + 0.5) / W
+        y0 = (py + 0.5) / H
+
+        # residual at point in YCbCr
+        res = (ycc[py, px, :] - base_ycc_full[py, px, :]).astype(np.float32)
+        # stroke amplitudes: aY from amp plus residual; chroma from residual only (scaled)
+        aY  = float(np.clip(res[0] * 2.0 + amp * 0.20, -1.0, 1.0))
+        aCb = float(np.clip(res[1] * 1.5, -1.0, 1.0))
+        aCr = float(np.clip(res[2] * 1.5, -1.0, 1.0))
+
+        # stroke sizes (normalized): tie to base_factor / resolution
+        # parallel larger, perpendicular smaller -> edge-like
+        sig_par  = float(np.clip(3.5 / max(W, H), 1e-4, 0.05))
+        sig_perp = float(np.clip(1.2 / max(W, H), 1e-4, 0.03))
+
+        stroke_arr[i] = [x0, y0, theta, aY, aCb, aCr, sig_par, sig_perp]
+
+    # quantize base + strokes
+    # Base as uint8 YCbCr (already 0..1)
+    base_u8 = (np.clip(base, 0, 1) * 255.0 + 0.5).astype(np.uint8)
+
+    # Strokes quantized
+    # pack to int16 using quant_bits (e.g., 10-12 bits effective)
+    qb = int(quant_bits)
+    if qb < 8 or qb > 14:
+        qb = 12
+    Q = (1 << qb) - 1
+
+    def q01(x):  # [0,1] -> [0,Q]
+        return np.clip(np.round(x * Q), 0, Q).astype(np.int32)
+
+    def qpm1(x):  # [-1,1] -> [0,Q]
+        return np.clip(np.round((x * 0.5 + 0.5) * Q), 0, Q).astype(np.int32)
+
+    def qang(x):  # [-pi,pi] -> [0,Q]
+        # wrap to [-pi,pi]
+        x = (x + np.pi) % (2*np.pi) - np.pi
+        return np.clip(np.round((x / (2*np.pi) + 0.5) * Q), 0, Q).astype(np.int32)
+
+    def qs(x):  # [0,0.1] roughly -> [0,Q]
+        return np.clip(np.round((x / 0.1) * Q), 0, Q).astype(np.int32)
+
+    sx = q01(stroke_arr[:, 0])
+    sy = q01(stroke_arr[:, 1])
+    st = qang(stroke_arr[:, 2])
+    aY = qpm1(stroke_arr[:, 3])
+    aCb = qpm1(stroke_arr[:, 4])
+    aCr = qpm1(stroke_arr[:, 5])
+    sp = qs(stroke_arr[:, 6])
+    sn = qs(stroke_arr[:, 7])
+
+    stroke_q = np.stack([sx, sy, st, aY, aCb, aCr, sp, sn], axis=1).astype(np.uint16)
+    stroke_bytes = stroke_q.tobytes(order="C")
+
+    # Build coeff bytes blob:
+    # [base_u8 bytes][stroke bytes]
+    base_bytes = base_u8.tobytes(order="C")
+    coeff_bytes = base_bytes + stroke_bytes
 
     meta = {
-        "type": "global_fft2_center",
-        "version": 2,
+        "type": "edge_brush_v1",
+        "version": 3,
         "max_side": int(max_side),
-        "keep": int(keep),
-        "square_N": int(N),
-        "res_h": shape_meta["res_h"],
-        "res_w": shape_meta["res_w"],
-        "pad_to_square_bottom": int(pad_bottom),
-        "pad_to_square_right": int(pad_right),
-        "dtype": "float16",
-        "coeff_shape": [3, int(keep), int(keep), 2],
-        "notes": "Global truncated 2D Fourier center-block coefficients; coefficients stored as float16 real/imag.",
+        "res_h": int(H),
+        "res_w": int(W),
+        "base_factor": int(base_factor),
+        "base_h": int(Hb),
+        "base_w": int(Wb),
+        "K": int(len(pts)),
+        "min_dist_px": int(min_dist_px),
+        "quant_bits": int(qb),
+        "sharpen": float(sharpen),
+        "base_dtype": "uint8",
+        "stroke_dtype": "uint16",
+        "stroke_shape": [int(len(pts)), 8],
+        "notes": "Novel: low-res YCbCr base + sparse anisotropic brushstroke atoms along edges.",
     }
 
     formula = pack_formula(meta, coeff_bytes)
     return formula, meta
 
 
-def formula_to_image_global_fft(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray:
-    keep = int(meta["keep"])
-    N = int(meta["square_N"])
-    shape = tuple(meta["coeff_shape"])  # (3, keep, keep, 2)
+def decode_edge_brush(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray:
+    H = int(meta["res_h"]); W = int(meta["res_w"])
+    Hb = int(meta["base_h"]); Wb = int(meta["base_w"])
+    K = int(meta["K"])
+    qb = int(meta["quant_bits"])
+    Q = (1 << qb) - 1
+    sharpen = float(meta.get("sharpen", 0.0))
 
-    coeff = np.frombuffer(coeff_bytes, dtype=np.float16)
-    if coeff.size != int(np.prod(shape)):
-        raise ValueError("Coefficient payload size mismatch (corrupt formula or wrong type).")
-    coeff = coeff.reshape(shape)
+    # split bytes
+    base_n = Hb * Wb * 3  # uint8
+    base_bytes = coeff_bytes[:base_n]
+    stroke_bytes = coeff_bytes[base_n:]
 
-    # unpack complex blocks
-    out_ch = []
-    for ch in range(3):
-        real = coeff[ch, :, :, 0].astype(np.float32)
-        imag = coeff[ch, :, :, 1].astype(np.float32)
-        block = (real + 1j * imag).astype(np.complex64)
-        chan = ifft2_from_center_block(N=N, keep=keep, block=block)
-        out_ch.append(chan)
+    base_u8 = np.frombuffer(base_bytes, dtype=np.uint8).reshape(Hb, Wb, 3)
+    base = base_u8.astype(np.float32) / 255.0
 
-    rgb01 = np.stack(out_ch, axis=-1)  # (N,N,3)
+    # upsample base to target size (in RGB then back to YCbCr for stroke add)
+    base_rgb_low = ycbcr_to_rgb(base)
+    base_rgb_full = upsample_bilinear(base_rgb_low, out_h=H, out_w=W)
+    base_ycc_full = rgb_to_ycbcr(base_rgb_full)
 
-    # Crop back to resized (pre-square padding) size
-    res_h = int(meta["res_h"])
-    res_w = int(meta["res_w"])
-    rgb01 = rgb01[:res_h, :res_w, :]
+    stroke_q = np.frombuffer(stroke_bytes, dtype=np.uint16)
+    if stroke_q.size != K * 8:
+        raise ValueError("Stroke payload mismatch (corrupt formula).")
+    stroke_q = stroke_q.reshape(K, 8).astype(np.int32)
 
-    return to_uint8(rgb01)
+    def uq01(q):  # [0,Q] -> [0,1]
+        return (q / float(Q)).astype(np.float32)
 
+    def uqpm1(q):  # [0,Q] -> [-1,1]
+        return ((q / float(Q)) * 2.0 - 1.0).astype(np.float32)
 
-# ============================================================
-# Novel representation: Spectral Mosaic (tiled windowed Fourier)
-# ============================================================
+    def uqang(q):  # [0,Q] -> [-pi,pi]
+        return (((q / float(Q)) - 0.5) * (2*np.pi)).astype(np.float32)
 
-def hann2d(tile: int) -> np.ndarray:
-    """
-    2D Hann window for overlap-add.
-    """
-    h = np.hanning(tile).astype(np.float32)
-    w2d = np.outer(h, h)
-    # avoid near-zero division issues in normalization:
-    return np.clip(w2d, 1e-6, 1.0)
+    def uqs(q):  # [0,Q] -> [0,0.1]
+        return ((q / float(Q)) * 0.1).astype(np.float32)
 
+    x0 = uq01(stroke_q[:, 0])
+    y0 = uq01(stroke_q[:, 1])
+    th = uqang(stroke_q[:, 2])
+    aY  = uqpm1(stroke_q[:, 3])
+    aCb = uqpm1(stroke_q[:, 4])
+    aCr = uqpm1(stroke_q[:, 5])
+    sp = uqs(stroke_q[:, 6])
+    sn = uqs(stroke_q[:, 7])
 
-def tiled_spectral_mosaic_encode(img01_rgb: np.ndarray, max_side: int, tile: int, overlap: int, keep: int) -> Tuple[str, Dict[str, Any]]:
-    """
-    Encode image as a sum of local windowed Fourier series:
-    - resize keep-aspect to max_side
-    - pad to tile grid with overlap-friendly stepping
-    - for each tile: multiply by Hann window, take FFT2, store centered keep×keep block
-    """
-    tile = int(tile)
-    overlap = int(overlap)
-    keep = int(keep)
-    if overlap < 0 or overlap >= tile:
-        raise ValueError("overlap must be in [0, tile-1].")
-    step = tile - overlap
-    if step <= 0:
-        raise ValueError("Invalid overlap; step must be > 0.")
+    strokes = np.stack([x0, y0, th, aY, aCb, aCr, sp, sn], axis=1).astype(np.float32)
 
-    # Pad to multiples of step and tile for clean tiling
-    pad_multiple = step
-    padded, shape_meta = resize_keep_aspect_and_pad(img01_rgb, max_side=max_side, pad_multiple=pad_multiple)
-
-    H, W, _ = padded.shape
-
-    # Ensure we can tile to cover fully with tiles of size tile and step stride
-    # Add extra padding so last tile fits:
-    extra_bottom = (tile - (H - tile) % step) % step if H >= tile else (tile - H)
-    extra_right  = (tile - (W - tile) % step) % step if W >= tile else (tile - W)
-
-    padded = np.pad(padded, ((0, extra_bottom), (0, extra_right), (0, 0)), mode="edge")
-    Hp, Wp, _ = padded.shape
-
-    if keep > tile:
-        keep = tile
-    if keep < 1:
-        raise ValueError("keep must be >= 1")
-
-    # tile grid
-    ys = list(range(0, Hp - tile + 1, step))
-    xs = list(range(0, Wp - tile + 1, step))
-    Ty, Tx = len(ys), len(xs)
-
-    win = hann2d(tile)
-
-    # coeff storage: (3, Ty, Tx, keep, keep, 2) float16
-    coeff = np.zeros((3, Ty, Tx, keep, keep, 2), dtype=np.float16)
-
-    c = tile // 2
-    half = keep // 2
-    r0 = c - half
-    r1 = r0 + keep
-
-    for ch in range(3):
-        for iy, y0 in enumerate(ys):
-            for ix, x0 in enumerate(xs):
-                patch = padded[y0:y0 + tile, x0:x0 + tile, ch].astype(np.float32)
-                patch_w = patch * win
-
-                F = np.fft.fft2(patch_w)
-                Fs = np.fft.fftshift(F)
-                block = Fs[r0:r1, r0:r1].astype(np.complex64)
-
-                coeff[ch, iy, ix, :, :, 0] = block.real.astype(np.float16)
-                coeff[ch, iy, ix, :, :, 1] = block.imag.astype(np.float16)
-
-    coeff_bytes = coeff.tobytes(order="C")
-
-    meta = {
-        "type": "spectral_mosaic_v1",
-        "version": 2,
-        "max_side": int(max_side),
-        "tile": int(tile),
-        "overlap": int(overlap),
-        "step": int(step),
-        "keep": int(keep),
-        "Ty": int(Ty),
-        "Tx": int(Tx),
-        "pad_h": int(Hp),
-        "pad_w": int(Wp),
-        "res_h": int(shape_meta["res_h"]),
-        "res_w": int(shape_meta["res_w"]),
-        "extra_bottom": int(extra_bottom),
-        "extra_right": int(extra_right),
-        "dtype": "float16",
-        "coeff_shape": [3, int(Ty), int(Tx), int(keep), int(keep), 2],
-        "notes": "Novel windowed local Fourier expansion (STFT-like). Tiles overlap-add with Hann window.",
-    }
-
-    formula = pack_formula(meta, coeff_bytes)
-    return formula, meta
+    ycc_out = render_brushstrokes(base_ycc_full, strokes, out_h=H, out_w=W, sharpen=sharpen)
+    rgb = ycbcr_to_rgb(ycc_out)
+    return to_uint8(rgb)
 
 
-def tiled_spectral_mosaic_decode(meta: Dict[str, Any], coeff_bytes: bytes) -> np.ndarray:
-    tile = int(meta["tile"])
-    overlap = int(meta["overlap"])
-    step = int(meta["step"])
-    keep = int(meta["keep"])
-    Ty = int(meta["Ty"])
-    Tx = int(meta["Tx"])
-    Hp = int(meta["pad_h"])
-    Wp = int(meta["pad_w"])
-    res_h = int(meta["res_h"])
-    res_w = int(meta["res_w"])
-
-    shape = tuple(meta["coeff_shape"])  # (3, Ty, Tx, keep, keep, 2)
-    coeff = np.frombuffer(coeff_bytes, dtype=np.float16)
-    if coeff.size != int(np.prod(shape)):
-        raise ValueError("Coefficient payload size mismatch (corrupt formula or wrong type).")
-    coeff = coeff.reshape(shape)
-
-    ys = list(range(0, Hp - tile + 1, step))
-    xs = list(range(0, Wp - tile + 1, step))
-    if len(ys) != Ty or len(xs) != Tx:
-        raise ValueError("Tile grid mismatch (corrupt meta).")
-
-    win = hann2d(tile)
-    win_sum = np.zeros((Hp, Wp), dtype=np.float32)
-
-    # outputs
-    out = np.zeros((Hp, Wp, 3), dtype=np.float32)
-
-    c = tile // 2
-    half = keep // 2
-    r0 = c - half
-    r1 = r0 + keep
-
-    for ch in range(3):
-        for iy, y0 in enumerate(ys):
-            for ix, x0 in enumerate(xs):
-                real = coeff[ch, iy, ix, :, :, 0].astype(np.float32)
-                imag = coeff[ch, iy, ix, :, :, 1].astype(np.float32)
-                block = (real + 1j * imag).astype(np.complex64)
-
-                Fs = np.zeros((tile, tile), dtype=np.complex64)
-                Fs[r0:r1, r0:r1] = block
-                F = np.fft.ifftshift(Fs)
-                patch = np.fft.ifft2(F).real.astype(np.float32)
-                patch = np.clip(patch, 0.0, 1.0)
-
-                out[y0:y0 + tile, x0:x0 + tile, ch] += patch * win
-                # accumulate weights once (independent of channel)
-                if ch == 0:
-                    win_sum[y0:y0 + tile, x0:x0 + tile] += win
-
-    # normalize overlap-add
-    win_sum = np.clip(win_sum, 1e-6, None)
-    out[:, :, 0] /= win_sum
-    out[:, :, 1] /= win_sum
-    out[:, :, 2] /= win_sum
-
-    # crop to resized shape
-    out = out[:res_h, :res_w, :]
-    return to_uint8(out)
-
-
-# ============================================================
-# LaTeX explanations (clean + novel)
-# ============================================================
-
-def latex_global_fft(keep: int) -> str:
-    m = int(keep) // 2
+def latex_edge_brush() -> str:
     return (
-        r"Global Fourier depiction:"
+        r"Novel depiction: Edge + Brushstroke Field (EBF)."
         "\n"
-        rf"\[ f(x,y)\approx \sum_{{u=-{m}}}^{{{m}}}\sum_{{v=-{m}}}^{{{m}}} "
-        r"C_{u,v}\,e^{i2\pi(ux+vy)} \]"
+        r"We store a low-frequency base color field $B(x,y)$ and add sparse oriented atoms:"
         "\n"
-        r"The single formula string encodes the complex coefficients $C_{u,v}$ (for each RGB channel)."
-    )
-
-
-def latex_spectral_mosaic(tile: int, keep: int) -> str:
-    m = int(keep) // 2
-    return (
-        r"Novel depiction: **Spectral Mosaic** (windowed local Fourier expansion)."
+        r"\[ I(x,y)=U(B(x,y)) + \sum_{k=1}^{K}\alpha_k\;\phi\!\left(R_{\theta_k}\begin{bmatrix}x-x_k\\y-y_k\end{bmatrix};"
+        r"\sigma_{k,\parallel},\sigma_{k,\perp}\right) \]"
         "\n"
-        r"We tile the image into overlapping patches and express each patch as a truncated Fourier series:"
-        "\n"
-        rf"\[ f(x,y)\approx \sum_{{p,q}} w_{{p,q}}(x,y)\;"
-        rf"\sum_{{u=-{m}}}^{{{m}}}\sum_{{v=-{m}}}^{{{m}}} C_{{p,q,u,v}}\;e^{{i2\pi(u x_{{p,q}} + v y_{{p,q}})}} \]"
-        "\n"
-        rf"Here $w_{{p,q}}$ is a 2D Hann window over a tile of size {tile}×{tile}, "
-        r"and $(x_{p,q},y_{p,q})$ are local tile coordinates."
-        "\n"
-        r"This representation behaves like a **mathematical stained-glass**: local spectra stitched by overlap-add."
+        r"$U$ is a deterministic upsampler (no extra bytes), and each $\phi$ is an anisotropic edge-like brushstroke."
     )
 
 
 # ============================================================
-# Streamlit App
+# Streamlit app
 # ============================================================
 
-st.set_page_config(page_title="Image ⇄ Formula (Novel)", layout="wide")
-st.title("Image ⇄ Formula — High-Resolution + Novel Spectral Mosaic")
+st.set_page_config(page_title="Image ⇄ Formula (New Compression)", layout="wide")
+st.title("Image ⇄ Formula — Higher Resolution, Smaller Formula (Edge + Brushstroke Field)")
 
 st.markdown(
-    "- **Image → Formula**: pick an image → you get ONE formula string.\n"
-    "- **Formula → Image**: paste the formula → you get the image.\n\n"
-    "**Two math depictions**:\n"
-    "1) Global Fourier (classic)\n"
-    "2) **Spectral Mosaic** (novel): tiled, windowed local Fourier expansions stitched by overlap-add.\n"
+    "This version introduces a **new approach** designed to **increase resolution while decreasing formula size**:\n\n"
+    "- **EBF** = low-res YCbCr base + **sparse edge brushstrokes** (math atoms)\n"
+    "- Great for large images because edges are sparse.\n\n"
+    "Modes:\n"
+    "- Image → Formula\n"
+    "- Formula → Image"
 )
 
 mode = st.radio("Choose conversion", ["Image → Formula", "Formula → Image"], horizontal=True)
 st.divider()
 
 
-# ----------------------------
-# IMAGE -> FORMULA
-# ----------------------------
 if mode == "Image → Formula":
     with st.sidebar:
         st.header("Image input")
-
         local_images = list_local_images(".")
         source_mode = st.radio("Source", ["Local file", "Upload"], index=0)
 
@@ -534,81 +521,31 @@ if mode == "Image → Formula":
             upload = st.file_uploader("Upload image", type=["png", "jpg", "jpeg", "webp", "bmp"])
 
         st.divider()
-        st.header("Representation")
+        st.header("EBF settings")
 
-        rep = st.radio(
-            "Math depiction",
-            ["Spectral Mosaic (Novel)", "Global Fourier (Classic)"],
-            index=0
-        )
+        max_side = st.select_slider("Max side (preserve aspect)", options=[512, 768, 1024, 1280, 1536, 2048], value=1536)
+        base_factor = st.select_slider("Base downsample factor", options=[4, 6, 8, 10, 12, 16], value=10)
+        K = st.slider("Number of brushstrokes (K)", min_value=100, max_value=4000, value=900, step=50)
+        min_dist = st.slider("Min distance between strokes (px)", min_value=2, max_value=20, value=6, step=1)
+        quant_bits = st.select_slider("Quantization bits (smaller=smaller formula)", options=[9, 10, 11, 12, 13], value=11)
+        sharpen = st.slider("Deterministic sharpening (no extra bytes)", 0.0, 1.5, 0.6, 0.05)
 
-        st.divider()
-        st.header("Quality preset")
-
-        preset = st.selectbox(
-            "Preset",
-            [
-                "Balanced (recommended)",
-                "High Fidelity",
-                "Extreme (big formula)",
-                "Custom"
-            ],
-            index=0
-        )
-
-        # Higher resolution choices
-        max_side_options = [256, 384, 512, 768, 1024, 1280, 1536]
-        if preset == "Balanced (recommended)":
-            max_side = 768
-            tile = 96
-            overlap = 48
-            keep = 21
-        elif preset == "High Fidelity":
-            max_side = 1024
-            tile = 128
-            overlap = 64
-            keep = 29
-        elif preset == "Extreme (big formula)":
-            max_side = 1536
-            tile = 160
-            overlap = 80
-            keep = 33
-        else:
-            max_side = st.select_slider("Max side (preserve aspect)", options=max_side_options, value=768)
-
-            if rep.startswith("Spectral"):
-                tile = st.select_slider("Tile size", options=[64, 80, 96, 112, 128, 160, 192, 224, 256], value=96)
-                overlap = st.select_slider("Overlap", options=[0, 16, 24, 32, 48, 64, 80, 96, 112, 128], value=48)
-                # keep must be <= tile, odd recommended
-                keep = st.slider("Frequencies kept per tile (keep×keep)", min_value=5, max_value=min(65, int(tile)), value=21, step=2)
-            else:
-                # global FFT uses a square canvas N; keep <= N; keep odd recommended
-                keep = st.slider("Frequencies kept (keep×keep)", min_value=9, max_value=129, value=33, step=2)
-                tile = 0
-                overlap = 0
-
-        st.caption("Tip: Spectral Mosaic generally gives better perceptual reconstructions per byte than global FFT.")
+        st.caption("Try: Max side 1536–2048 + base_factor 10–16 + K 600–1200 for strong compression.")
 
     try:
         img01 = load_image_from_choice(source_mode, chosen_local, upload)
-
         st.subheader("Selected image")
         st.image(to_uint8(img01), use_container_width=True)
 
-        if rep.startswith("Spectral"):
-            formula, meta = tiled_spectral_mosaic_encode(
-                img01_rgb=img01,
-                max_side=int(max_side),
-                tile=int(tile),
-                overlap=int(overlap),
-                keep=int(keep),
-            )
-        else:
-            formula, meta = image_to_formula_global_fft(
-                img01_rgb=img01,
-                max_side=int(max_side),
-                keep=int(keep),
-            )
+        formula, meta = encode_edge_brush(
+            img01_rgb=img01,
+            max_side=int(max_side),
+            base_factor=int(base_factor),
+            K=int(K),
+            min_dist_px=int(min_dist),
+            quant_bits=int(quant_bits),
+            sharpen=float(sharpen),
+        )
 
         size_bytes = len(formula.encode("utf-8"))
 
@@ -617,25 +554,15 @@ if mode == "Image → Formula":
 
         a, b, c = st.columns(3)
         a.metric("Formula size", human_size(size_bytes))
-        b.metric("Resized image", f"{meta['res_w']}×{meta['res_h']}")
-        c.metric("Representation", meta["type"])
+        b.metric("Reconstruction size", f"{meta['res_w']}×{meta['res_h']}")
+        c.metric("Brushstrokes K", str(meta["K"]))
 
-        st.subheader("Math formula depiction")
-        if meta["type"] == "spectral_mosaic_v1":
-            st.latex(latex_spectral_mosaic(tile=int(meta["tile"]), keep=int(meta["keep"])))
-        else:
-            st.latex(latex_global_fft(keep=int(meta["keep"])))
+        st.subheader("Mathematical depiction")
+        st.latex(latex_edge_brush())
 
-        # Preview reconstruction
-        st.subheader("Reconstructed preview (from the formula)")
+        st.subheader("Reconstructed preview (from formula)")
         meta2, coeff2 = unpack_formula(formula)
-        if meta2["type"] == "spectral_mosaic_v1":
-            recon = tiled_spectral_mosaic_decode(meta2, coeff2)
-        elif meta2["type"] == "global_fft2_center":
-            recon = formula_to_image_global_fft(meta2, coeff2)
-        else:
-            raise ValueError("Unknown representation in formula.")
-
+        recon = decode_edge_brush(meta2, coeff2)
         st.image(recon, use_container_width=True)
 
         st.download_button(
@@ -645,64 +572,42 @@ if mode == "Image → Formula":
             mime="text/plain",
         )
 
+        with st.expander("Show decoded meta"):
+            st.json(meta)
+
     except Exception as e:
         st.error(f"Image → Formula failed: {e}")
 
 
-# ----------------------------
-# FORMULA -> IMAGE
-# ----------------------------
 else:
     st.subheader("Paste a formula string to reconstruct the image")
     formula_in = st.text_area("Formula", height=220, placeholder=f"{APP_FORMULA_PREFIX}...")
 
-    colA, colB = st.columns([1, 1])
+    if st.button("Reconstruct image", type="primary"):
+        try:
+            meta, coeff = unpack_formula(formula_in)
+            if meta.get("type") != "edge_brush_v1":
+                raise ValueError(f"Unsupported type: {meta.get('type')} (expected edge_brush_v1).")
 
-    with colA:
-        if st.button("Reconstruct image", type="primary"):
-            try:
-                meta, coeff = unpack_formula(formula_in)
+            img = decode_edge_brush(meta, coeff)
+            st.success(f"Reconstructed {meta['res_w']}×{meta['res_h']} (EBF).")
+            st.image(img, use_container_width=True)
 
-                if meta["type"] == "spectral_mosaic_v1":
-                    img = tiled_spectral_mosaic_decode(meta, coeff)
-                elif meta["type"] == "global_fft2_center":
-                    img = formula_to_image_global_fft(meta, coeff)
-                else:
-                    raise ValueError(f"Unknown representation type: {meta.get('type')}")
+            out_pil = Image.fromarray(img, mode="RGB")
+            buf = io.BytesIO()
+            out_pil.save(buf, format="PNG")
+            st.download_button(
+                "Download reconstructed PNG",
+                data=buf.getvalue(),
+                file_name="reconstructed.png",
+                mime="image/png",
+            )
 
-                st.success(
-                    f"Reconstructed {meta['res_w']}×{meta['res_h']} "
-                    f"({meta['type']}, keep={meta['keep']})."
-                )
-                st.image(img, use_container_width=True)
+            st.subheader("Mathematical depiction")
+            st.latex(latex_edge_brush())
 
-                out_pil = Image.fromarray(img, mode="RGB")
-                buf = io.BytesIO()
-                out_pil.save(buf, format="PNG")
+            with st.expander("Show decoded meta"):
+                st.json(meta)
 
-                st.download_button(
-                    "Download reconstructed PNG",
-                    data=buf.getvalue(),
-                    file_name="reconstructed.png",
-                    mime="image/png",
-                )
-
-                st.subheader("Math formula depiction")
-                if meta["type"] == "spectral_mosaic_v1":
-                    st.latex(latex_spectral_mosaic(tile=int(meta["tile"]), keep=int(meta["keep"])))
-                else:
-                    st.latex(latex_global_fft(keep=int(meta["keep"])))
-
-                with st.expander("Show decoded meta"):
-                    st.json(meta)
-
-            except Exception as e:
-                st.error(f"Formula → Image failed: {e}")
-
-    with colB:
-        st.markdown(
-            "**Expected format**:\n\n"
-            f"- Must start with `{APP_FORMULA_PREFIX}`\n"
-            "- Contains compressed meta + coefficient bytes.\n\n"
-            "**Tip**: If you want the most novel depiction + best quality per size, use **Spectral Mosaic**."
-        )
+        except Exception as e:
+            st.error(f"Formula → Image failed: {e}")
